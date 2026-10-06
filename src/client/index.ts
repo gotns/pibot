@@ -162,7 +162,8 @@ function renderSpotifyNowPlaying(playback: SpotifyNowPlaying | undefined): void 
 	if (playback.coverUrl) {
 		const image = document.createElement("img");
 		image.src = playback.coverUrl;
-		image.alt = "Spotify cover";
+		image.alt = "cover";
+		image.onerror = () => image.remove();
 		spotifyNowPlayingElement.append(image);
 	}
 	const text = document.createElement("div");
@@ -187,22 +188,24 @@ tools = createRobotTools({
 	setMicInputBlockedUntil,
 	onSpeakingChange: setTtsSpeaking,
 	onPlaybackAudio: (samples, sampleRate) => bargeInDetector.handlePlaybackAudio(samples, sampleRate),
-	onSpotifyPlaybackChange: renderSpotifyNowPlaying,
 	onSpotifyStatusChange: updateSpotifyPanel,
+	onNowPlaying: renderSpotifyNowPlaying,
+	onRadioPlayingChange: (playing) => send({ type: "radio_state", playing }),
 });
 updateSpotifyPanel();
 void tools.spotify
 	.handleRedirectCallback()
 	.then((connected) => {
-		updateSpotifyPanel();
 		if (!connected) return;
 		spotifyPanelElement.hidden = false;
 		void tools.spotify
 			.loadDevices()
-			.then(updateSpotifyPanel)
 			.catch((error: unknown) => log(`Spotify devices failed: ${stringifyLogValue(error)}`, "spotify"));
 	})
-	.catch((error: unknown) => log(`Spotify auth failed: ${stringifyLogValue(error)}`, "spotify"));
+	.catch((error: unknown) => {
+		spotifyPanelElement.hidden = false;
+		log(`Spotify login failed: ${stringifyLogValue(error)}`, "spotify");
+	});
 
 function initializeRobotServer(): void {
 	if (robotServer) return;
@@ -219,10 +222,12 @@ function initializeRobotServer(): void {
 		events: {
 			onState: (state) => {
 				serverRobotState = state;
+				tools.radio.setDucked(state.phase === "thinking" || state.phase === "tool" || state.phase === "speaking");
 				if (state.phase !== "hearing") bargeInDetector.resetStreaming();
 				renderRobotFace();
 			},
 			onLog: (entry) => robotLog.appendLine(entry.origin, entry.tags, entry.message),
+			onSpotifyPlayback: renderSpotifyNowPlaying,
 			onRejected: (reason) => {
 				showErrorFor(5000);
 				robotLog.appendLine("client", ["error"], `connection rejected: ${reason}`);
@@ -444,6 +449,8 @@ async function startRobot(): Promise<void> {
 		return;
 	}
 	setupPanelElement.mode = "starting";
+	// Still inside the Start tap: lets the radio start later without another tap (iOS).
+	tools.radio.unlock();
 	try {
 		tools.speech.enableTts();
 		log("TTS enabled: Qwen3 local clone", "stt");
@@ -472,20 +479,20 @@ async function startRobot(): Promise<void> {
 setupPanelElement.addEventListener("start-robot", () => void startRobot());
 setupPanelElement.addEventListener("spotify-setup", () => {
 	spotifyPanelElement.hidden = false;
-	updateSpotifyPanel();
-	if (tools.spotify.getStatus().connected) {
-		void tools.spotify
-			.loadDevices()
-			.then(updateSpotifyPanel)
-			.catch((error: unknown) => log(`Spotify devices failed: ${stringifyLogValue(error)}`, "spotify"));
-	}
+	void tools.spotify
+		.refreshStatus()
+		.then(() => (tools.spotify.getStatus().connected ? tools.spotify.loadDevices() : undefined))
+		.catch((error: unknown) => log(`Spotify status failed: ${stringifyLogValue(error)}`, "spotify"));
 });
 spotifyPanelElement.addEventListener("spotify-close", () => {
 	spotifyPanelElement.hidden = true;
 });
 spotifyPanelElement.addEventListener("spotify-client-id", (event) => {
 	const detail = (event as CustomEvent<{ clientId: string }>).detail;
-	tools.spotify.setClientId(detail.clientId);
+	if (detail.clientId.trim() === tools.spotify.getStatus().clientId) return;
+	void tools.spotify
+		.setClientId(detail.clientId)
+		.catch((error: unknown) => log(`Spotify client ID failed: ${stringifyLogValue(error)}`, "spotify"));
 });
 spotifyPanelElement.addEventListener("spotify-connect", () => {
 	void tools.spotify
@@ -493,18 +500,20 @@ spotifyPanelElement.addEventListener("spotify-connect", () => {
 		.catch((error: unknown) => log(`Spotify login failed: ${stringifyLogValue(error)}`, "spotify"));
 });
 spotifyPanelElement.addEventListener("spotify-disconnect", () => {
-	tools.spotify.disconnect();
-	updateSpotifyPanel();
+	void tools.spotify
+		.disconnect()
+		.catch((error: unknown) => log(`Spotify disconnect failed: ${stringifyLogValue(error)}`, "spotify"));
 });
 spotifyPanelElement.addEventListener("spotify-refresh-devices", () => {
 	void tools.spotify
 		.loadDevices()
-		.then(updateSpotifyPanel)
 		.catch((error: unknown) => log(`Spotify devices failed: ${stringifyLogValue(error)}`, "spotify"));
 });
 spotifyPanelElement.addEventListener("spotify-device", (event) => {
 	const detail = (event as CustomEvent<{ deviceId?: string }>).detail;
-	tools.spotify.selectDevice(detail.deviceId);
+	void tools.spotify
+		.selectDevice(detail.deviceId)
+		.catch((error: unknown) => log(`Spotify device failed: ${stringifyLogValue(error)}`, "spotify"));
 });
 spotifyPanelElement.addEventListener("spotify-browser-player", () => {
 	void tools.spotify
@@ -536,6 +545,11 @@ document.addEventListener("fullscreenchange", () => {
 
 function handleRobotTouch(event: PointerEvent): void {
 	if (event.target === backButton) return;
+	// Tapping the now-playing card stops the radio instead of interrupting the robot.
+	if (event.target instanceof Node && spotifyNowPlayingElement.contains(event.target)) {
+		if (tools.radio.isPlaying()) tools.radio.stop();
+		return;
+	}
 	event.preventDefault();
 	abortCurrentAgentTurn();
 }

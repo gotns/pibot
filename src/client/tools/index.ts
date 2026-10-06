@@ -2,6 +2,7 @@ import type { RobotRpcMap, RobotRpcType, SpotifyNowPlaying } from "../../types.j
 import type { ClientLogger } from "../logger.js";
 import { createMotorTool, type MotorTool } from "./motor.js";
 import { createPhotoTool, type PhotoTool } from "./photo.js";
+import { createRadioTool, type RadioTool } from "./radio.js";
 import { createSpeechTool, type SpeechTool } from "./speech.js";
 import { createSpotifyTool, type SpotifyTool } from "./spotify.js";
 
@@ -13,7 +14,7 @@ export type RobotToolHandler<T extends RobotRpcType> = (
 export interface RobotToolHandlers {
 	take_photo: RobotToolHandler<"take_photo">;
 	motor: RobotToolHandler<"motor">;
-	spotify: RobotToolHandler<"spotify">;
+	radio: RobotToolHandler<"radio">;
 	speak: RobotToolHandler<"speak">;
 	cancel_speech: RobotToolHandler<"cancel_speech">;
 }
@@ -22,6 +23,7 @@ export interface RobotTools {
 	handlers: RobotToolHandlers;
 	photo: PhotoTool;
 	motor: MotorTool;
+	radio: RadioTool;
 	spotify: SpotifyTool;
 	speech: SpeechTool;
 }
@@ -32,14 +34,19 @@ export function createRobotTools(deps: {
 	setMicInputBlockedUntil: (time: number) => void;
 	onSpeakingChange: (speaking: boolean) => void;
 	onPlaybackAudio: (samples: Float32Array, sampleRate: number) => void;
-	onSpotifyPlaybackChange: (playback: SpotifyNowPlaying | undefined) => void;
 	onSpotifyStatusChange: () => void;
+	onNowPlaying: (playback: SpotifyNowPlaying | undefined) => void;
+	onRadioPlayingChange: (playing: boolean) => void;
 }): RobotTools {
 	const photo = createPhotoTool({ logger: deps.logger });
 	const motor = createMotorTool({ logger: deps.logger });
+	const radio = createRadioTool({
+		logger: deps.logger,
+		onNowPlaying: deps.onNowPlaying,
+		onPlayingChange: deps.onRadioPlayingChange,
+	});
 	const spotify = createSpotifyTool({
 		logger: deps.logger,
-		onPlaybackChange: deps.onSpotifyPlaybackChange,
 		onStatusChange: deps.onSpotifyStatusChange,
 	});
 	const speech = createSpeechTool({
@@ -53,12 +60,13 @@ export function createRobotTools(deps: {
 		handlers: {
 			take_photo: photo.handle,
 			motor: motor.handle,
-			spotify: spotify.handle,
+			radio: radio.handle,
 			speak: speech.handleSpeak,
 			cancel_speech: speech.handleCancelSpeech,
 		},
 		photo,
 		motor,
+		radio,
 		spotify,
 		speech,
 	};

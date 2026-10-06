@@ -1,4 +1,5 @@
 import type { IncomingMessage, Server } from "node:http";
+import type { Socket } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import type { ClientMessage } from "../types.js";
 import type { AuthenticatedUser } from "./auth.js";
@@ -21,6 +22,7 @@ export function attachWebSockets(deps: {
 	server: Server;
 	logger: Logger;
 	authenticate: (req: IncomingMessage) => Promise<AuthenticatedUser | undefined>;
+	onClientSocket: (socket: Socket, userId: string) => void;
 	onEvent: (event: WebsocketEvent) => void | Promise<void>;
 }): WebsocketServer {
 	const clients = new Map<string, WebSocket>();
@@ -68,6 +70,7 @@ export function attachWebSockets(deps: {
 			return;
 		}
 		clients.set(userId, ws);
+		deps.onClientSocket(req.socket, userId);
 		emit({ type: "client_connected", client: ws, user, userId });
 		ws.on("message", (data, isBinary) => {
 			try {

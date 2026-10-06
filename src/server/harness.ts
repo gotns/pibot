@@ -1,4 +1,11 @@
-import { AgentHarness, InMemorySessionRepo } from "@earendil-works/pi-agent-core";
+import {
+	AgentHarness,
+	DEFAULT_COMPACTION_SETTINGS,
+	estimateContextTokens,
+	estimateTokens,
+	JsonlSessionRepo,
+	shouldCompact,
+} from "@earendil-works/pi-agent-core";
 import type { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import {
 	type Api,
@@ -6,6 +13,7 @@ import {
 	getModel,
 	getModels,
 	getProviders,
+	isContextOverflow,
 	type KnownProvider,
 	type Model,
 	type TextContent,
@@ -13,12 +21,20 @@ import {
 import type { LocalLlmConfig, LocalLlmId } from "./llama.js";
 import { localLlmConfigs } from "./llama.js";
 import type { Logger } from "./logger.js";
+import type { RadioService } from "./radio.js";
 import type { RobotClient } from "./robot-client.js";
 import { createRobotTools, pruneImagesForContext } from "./tools/index.js";
 import type { MemoryStore } from "./tools/memory.js";
+import type { SpotifyHandler } from "./tools/spotify.js";
 
 const LOCAL_PROVIDER = "llama-cpp-local";
 const LOCAL_API_KEY = "EMPTY";
+// JsonlSessionRepo groups session files by a cwd key; each user has their own sessions dir, so one fixed key.
+const SESSION_CWD = "pibot";
+const compactionInstructions =
+	"This is a spoken conversation between a user and a small voice robot, not a coding session. Under Goal, list the topics and requests discussed. Record facts the user shared about themselves, their preferences, what the robot did with its tools, what it promised, and open questions. Write (none) for anything about files or code.";
+const overflowRetryPrompt =
+	"Internal continuation: the conversation history was too long and has just been compacted into a summary. Answer the user's last message now, briefly, in English.";
 
 function createLocalModel(config: LocalLlmConfig, baseUrl: string, contextWindow: number): Model<"openai-completions"> {
 	return {
@@ -41,7 +57,7 @@ function createLocalModel(config: LocalLlmConfig, baseUrl: string, contextWindow
 			supportsStore: false,
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: false,
-			supportsUsageInStreaming: false,
+			supportsUsageInStreaming: true,
 			supportsStrictMode: false,
 			maxTokensField: "max_tokens",
 		},
@@ -67,50 +83,60 @@ function formatMemories(memories: string[]): string {
 	return memories.map((memory, index) => `${index}: ${memory}`).join("\n");
 }
 
-const robotInstructions =
-	"Du bist das Gehirn eines kleinen Roboters mit Smartphone. Antworte immer auf Deutsch. Sei verspielt, freundlich und sicher. Dein Text wird direkt an eine Plaintext-Sprachausgabe gesendet: Verwende kein Markdown, keine Listen, keine Codeblöcke, keine Überschriften und keine Emojis. Schreibe Zahlen so, dass eine Sprachausgabe sie natürlich vorliest: vermeide Ziffern mit Tausender- oder Dezimaltrennzeichen wie 6.400 oder 1,23; schreibe stattdessen ausgeschriebene oder eindeutig sprechbare Formen wie sechstausendvierhundert, eins Komma zwei drei oder one point two three, passend zur Antwortsprache. Nutze Bewegungswerkzeuge nur für kurze Dauer. Die Bewegungswerkzeuge stoppen automatisch nach ihrer Dauer. Die Hardware kann nur vorwärts fahren und sich gegen den Uhrzeigersinn drehen; rückwärts und rechts gibt es nicht. Für ungefähre Drehwinkel nutze turn_left_degrees. Wenn eine Aufgabe ein Werkzeug erfordert, rufe es sofort per Tool-Call auf, bevor du antwortest; kündige es nicht nur an. Nutze spotify_search für Musik, Kinderlieder, Playlists, Podcasts oder Hörbücher, wenn du die exakte Spotify-URI noch nicht kennst; fordere dabei mindestens fünf Ergebnisse an, außer der Nutzer verlangt ausdrücklich weniger; spiele danach die gewünschte URI mit spotify_play ab. Spotify itemType-Werte sind exakt track, album, playlist, show, episode oder audiobook; für Podcasts nutze show, für Podcast-Folgen episode, niemals podcast. Nutze spotify_control zum Pausieren, Fortsetzen, Überspringen oder Prüfen der aktuellen Wiedergabe. Wenn du aktuelle Fakten oder Internet-Informationen brauchst, nutze web_search. Wenn du Details aus einem gefundenen Treffer brauchst, nutze fetch_page_content mit der URL.";
+const robotInstructions = `You are the brain of a small robot with a smartphone. Always answer in English. Be playful, friendly, and safe. Your text is sent directly to a plain-text speech synthesizer: do not use Markdown, lists, code blocks, headings, or emojis. Write numbers so that a speech synthesizer reads them naturally: avoid digits with thousands or decimal separators like 6,400 or 1.23; write spoken forms instead, such as six thousand four hundred or one point two three. Use the movement tools only for short durations. The movement tools stop automatically after their duration. The hardware can only drive forward and turn counterclockwise; there is no reverse and no right turn. For approximate turn angles use turn_left_degrees. If a task requires a tool, call it immediately via a tool call before you answer; do not just announce it. For internet radio, use radio_search (searchBy tag for a genre or style, name for a specific station), then radio_play with a stationuuid from the results; pick a fitting station yourself instead of reading the list aloud, unless the user asks for options. Use radio_control to stop, pause, resume, make it louder or quieter, or say what is playing.${
+	process.env.BRAVE_API_KEY
+		? " If you need current facts or information from the internet, use web_search. If you need details from a search result, use fetch_page_content with the URL."
+		: " You have no web search: answer from your own knowledge, and use fetch_page_content only for a URL the user gives you."
+}`;
 
-const memoryToolInstructions = `Memory-Werkzeug:
-- Nutze das Memory-Werkzeug über die Tool-Calling-Schnittstelle, nicht als Text in deiner Antwort.
-- Schreibe niemals Tool-Aufrufe wie memory(...) oder JSON für Werkzeuge in den normalen Antworttext.
-- Wenn du Erinnerungen lesen sollst, rufe memory mit action read auf oder ohne Argumente.
-- Wenn du etwas speichern sollst, rufe memory mit action append und text auf. Behaupte erst danach, dass es gespeichert wurde.
-- Wenn du eine Erinnerung löschen sollst, rufe memory mit action remove und index auf.`;
+const spotifyInstructions =
+	" Use spotify_search for specific songs, artists, albums, playlists, children's songs, podcasts, or audiobooks when you do not know the exact Spotify URI yet; request at least five results unless the user explicitly asks for fewer; then play the chosen URI with spotify_play. Spotify itemType values are exactly track, album, playlist, show, episode, or audiobook; for podcasts use show, for podcast episodes use episode, never podcast. Use spotify_control to pause, resume, skip, or check the current playback. Prefer Spotify for specific items and the radio for genres and stations.";
+const noSpotifyInstructions =
+	" Spotify is not connected, so you cannot play a specific song, album, or podcast on demand; offer a fitting radio station instead.";
+const spotifyToolNames = ["spotify_search", "spotify_play", "spotify_control"];
+
+const memoryToolInstructions = `Memory tool:
+- Use the memory tool through the tool-calling interface, not as text in your answer.
+- Never write tool calls like memory(...) or JSON for tools into your normal answer text.
+- When you should read memories, call memory with action read or without arguments.
+- When you should store something, call memory with action append and text. Only claim it was stored after that.
+- When you should delete a memory, call memory with action remove and index.`;
 
 function hasRobotNameMemory(memories: string[]): boolean {
-	return memories.some((memory) => /\b(roboter|robot)\b.*\bheißt\b/i.test(memory));
+	return memories.some((memory) => /\b(roboter|robot)\b.*\b(heißt|is called)\b/i.test(memory));
 }
 
 function hasUserNameMemory(memories: string[]): boolean {
-	return memories.some((memory) => /\b(nutzer|user)\b.*\bheißt\b/i.test(memory));
+	return memories.some((memory) => /\b(nutzer|user)\b.*\b(heißt|is called)\b/i.test(memory));
 }
 
-async function buildSystemPrompt(memoryStore: MemoryStore): Promise<string> {
+async function buildSystemPrompt(memoryStore: MemoryStore, spotifyActive: boolean): Promise<string> {
+	const instructions = `${robotInstructions}${spotifyActive ? spotifyInstructions : noSpotifyInstructions}`;
 	const memories = await memoryStore.list();
 	const hasRobotName = hasRobotNameMemory(memories);
 	const hasUserName = hasUserNameMemory(memories);
 	if (!hasRobotName || !hasUserName) {
-		return `${robotInstructions}
+		return `${instructions}
 
-Ersteinrichtung:
-- Für diesen Nutzer ist die Ersteinrichtung noch nicht abgeschlossen. Du musst zuerst deinen Roboternamen speichern und danach den Namen des Nutzers speichern.
-- Bearbeite keine anderen Aufgaben und nutze keine anderen Werkzeuge, bevor beide Namen gespeichert sind.
-- Wenn noch kein Robotername gespeichert ist, frage kurz und freundlich, wie der Nutzer dich nennen möchte. Frage noch nicht nach dem Namen des Nutzers.
-- Wenn der Nutzer dir deinen Roboternamen nennt, rufe sofort das Memory-Werkzeug mit action append und einem Text im Format Der Roboter heißt NAME. auf. Antworte erst danach kurz, dass du dir deinen Namen gemerkt hast, und frage dann nach dem Namen des Nutzers.
-- Wenn dein Robotername bereits gespeichert ist, aber der Nutzername noch fehlt, frage kurz und freundlich: Und wie heißt du? Sage dabei, dass du dir auch ein Foto anschaust, um den Nutzer später besser wiederzuerkennen.
-- Wenn der Nutzer seinen Namen nennt und dein Robotername bereits gespeichert ist, rufe zuerst take_photo auf. Beschreibe für dich kurz, was du auf dem Foto über den Nutzer siehst, ohne unsichere Eigenschaften zu erfinden.
-- Rufe danach sofort das Memory-Werkzeug mit action append auf. Speichere Namen und Fotoeindruck gemeinsam in einem Text im Format Der Nutzer heißt NAME. Auf dem Foto sehe ich: BESCHREIBUNG.
-- Antworte erst nach dem Speichern kurz, dass du dir den Namen und den Fotoeindruck gemerkt hast.
-- Sobald beide Namen gespeichert sind, gilt ab dem nächsten Nutzerturn der normale Modus mit den gespeicherten Erinnerungen.
+First-time setup:
+- Setup is not finished for this user yet. You must first store your robot name and then store the user's name.
+- Do not handle any other tasks and do not use any other tools until both names are stored.
+- If no robot name is stored yet, ask briefly and kindly what the user would like to call you. Do not ask for the user's name yet.
+- When the user tells you your robot name, immediately call the memory tool with action append and a text in the format The robot is called NAME. Only then answer briefly that you remembered your name, and then ask for the user's name.
+- If your robot name is already stored but the user's name is missing, ask briefly and kindly: And what is your name? Mention that you will also take a look at a photo so you can recognize the user later.
+- When the user tells you their name and your robot name is already stored, first call take_photo. Briefly describe for yourself what you see about the user in the photo, without inventing uncertain traits.
+- Then immediately call the memory tool with action append. Store the name and the photo impression together in one text in the format The user is called NAME. In the photo I see: DESCRIPTION.
+- Only after storing, answer briefly that you remembered the name and the photo impression.
+- Once both names are stored, normal mode with the stored memories applies from the next user turn on.
 
-Persistente Erinnerungen:
+Persistent memories:
 ${formatMemories(memories)}
 
 ${memoryToolInstructions}`;
 	}
-	return `${robotInstructions}
+	return `${instructions}
 
-Persistente Erinnerungen:
+Persistent memories:
 ${formatMemories(memories)}
 
 ${memoryToolInstructions}`;
@@ -134,6 +160,7 @@ export type RobotHarnessEvent =
 
 export interface RobotHarness {
 	current: () => AgentHarness;
+	prompt: (text: string) => Promise<AssistantMessage>;
 	model: () => Model<Api>;
 	rebuildSession: (reason: string) => Promise<void>;
 }
@@ -146,12 +173,16 @@ export async function createRobotHarness(deps: {
 	localBaseUrl: string;
 	localContextWindow: number;
 	maxContextImages: number;
+	sessionsDir: string;
 	robot: RobotClient;
+	spotify: SpotifyHandler;
+	spotifyConnected: () => Promise<boolean>;
+	radio: RadioService;
 	onEvent: (event: RobotHarnessEvent) => void | Promise<void>;
 	beforeTool: (name: string, args: unknown) => void | Promise<void>;
 }): Promise<RobotHarness> {
-	const sessionRepo = new InMemorySessionRepo();
-	const tools = createRobotTools(deps.robot, deps.memoryStore);
+	const sessionRepo = new JsonlSessionRepo({ fs: deps.env, sessionsRoot: deps.sessionsDir });
+	const tools = createRobotTools(deps.robot, deps.memoryStore, deps.spotify, deps.radio);
 	const contextLogger = deps.logger.tag("context");
 	const emit = async (event: RobotHarnessEvent): Promise<void> => {
 		try {
@@ -161,10 +192,46 @@ export async function createRobotHarness(deps: {
 		}
 	};
 	const selectedModel = selectModel(deps.localLlm, deps.localBaseUrl, deps.localContextWindow);
-	let harness = await buildHarness();
+	// Conversations persist as JSONL under the user's dir; on startup continue the newest one.
+	const [latestSession] = await sessionRepo.list({ cwd: SESSION_CWD });
+	let session = latestSession ? await sessionRepo.open(latestSession) : await sessionRepo.create({ cwd: SESSION_CWD });
+	if (latestSession) {
+		contextLogger.log(`resumed conversation ${latestSession.path} (~${await contextTokens()} tokens)`);
+	}
+	let harness = buildHarness();
+	// Threshold compaction runs after a reply, while it is being spoken; the next prompt waits for it.
+	let pendingCompaction: Promise<void> = Promise.resolve();
 
-	async function buildHarness(): Promise<AgentHarness> {
-		const session = await sessionRepo.create({ id: `robot-demo-${Date.now()}` });
+	async function contextTokens(): Promise<number> {
+		const { messages } = await session.buildContext();
+		const summary = messages.find((message) => message.role === "compactionSummary");
+		// Replies kept from before a compaction carry usage that still counts the compacted-away history.
+		if (
+			summary &&
+			!messages.some((message) => message.role === "assistant" && message.timestamp > summary.timestamp)
+		) {
+			return messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+		}
+		return estimateContextTokens(messages).tokens;
+	}
+
+	// Same policy as the pi coding agent: compact once the context passes window - reserveTokens,
+	// or unconditionally after the server rejected a request as too long.
+	async function compactIfNeeded(afterOverflow: boolean): Promise<void> {
+		try {
+			const tokens = await contextTokens();
+			if (!afterOverflow && !shouldCompact(tokens, selectedModel.contextWindow, DEFAULT_COMPACTION_SETTINGS)) return;
+			contextLogger.log(
+				`compacting ${afterOverflow ? "after context overflow" : "at threshold"}: ~${tokens} tokens`,
+			);
+			const result = await harness.compact(compactionInstructions);
+			contextLogger.log(`compacted: ${result.tokensBefore} tokens -> ~${await contextTokens()} tokens`);
+		} catch (error) {
+			contextLogger.log(`compaction failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	function buildHarness(): AgentHarness {
 		const newHarness = new AgentHarness({
 			env: deps.env,
 			session,
@@ -177,7 +244,11 @@ export async function createRobotHarness(deps: {
 				return undefined;
 			},
 			tools,
-			systemPrompt: async () => buildSystemPrompt(deps.memoryStore),
+			systemPrompt: async ({ activeTools }) =>
+				buildSystemPrompt(
+					deps.memoryStore,
+					activeTools.some((tool) => tool.name === "spotify_search"),
+				),
 		});
 		newHarness.on("tool_call", async (event) => {
 			await deps.beforeTool(event.toolName, event.input);
@@ -215,9 +286,30 @@ export async function createRobotHarness(deps: {
 
 	return {
 		current: () => harness,
+		prompt: async (text) => {
+			await pendingCompaction;
+			// Spotify tools only while this account's Spotify is connected; otherwise the bot reaches for
+			// them on every music request and fails. Changed only on transitions (each change is logged).
+			const spotifyWanted = await deps.spotifyConnected();
+			const active = harness.getActiveTools().map((tool) => tool.name);
+			if (spotifyWanted !== active.includes("spotify_search")) {
+				const others = tools.map((tool) => tool.name).filter((name) => !spotifyToolNames.includes(name));
+				await harness.setActiveTools(spotifyWanted ? [...others, ...spotifyToolNames] : others);
+			}
+			await compactIfNeeded(false);
+			let message = await harness.prompt(text);
+			if (isContextOverflow(message, selectedModel.contextWindow)) {
+				await compactIfNeeded(true);
+				message = await harness.prompt(overflowRetryPrompt);
+			}
+			pendingCompaction = compactIfNeeded(false);
+			return message;
+		},
 		model: () => selectedModel,
 		rebuildSession: async (reason) => {
-			harness = await buildHarness();
+			// The old conversation stays on disk; start a new file.
+			session = await sessionRepo.create({ cwd: SESSION_CWD });
+			harness = buildHarness();
 			await emit({ type: "session_reset", reason });
 		},
 	};

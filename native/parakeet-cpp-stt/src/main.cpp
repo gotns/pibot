@@ -74,6 +74,9 @@ public:
         params.use_gpu = false;
         ctx_ = whisper_vad_init_from_file_with_params(model_path.c_str(), params);
         if (!ctx_) throw std::runtime_error("failed to load whisper.cpp Silero VAD model: " + model_path);
+        // whisper.cpp leaves the LSTM state buffer uninitialized at init; streaming
+        // from garbage state pins every probability at a constant (~0.35).
+        whisper_vad_reset_state(ctx_);
     }
 
     ~SileroVad() { whisper_vad_free(ctx_); }

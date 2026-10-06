@@ -26,6 +26,7 @@ export const serverConfig = {
 	llamaBaseUrl: process.env.LLAMA_BASE_URL ?? "http://127.0.0.1:8080/v1",
 	llamaHost: process.env.LLAMA_HOST ?? "127.0.0.1",
 	llamaPort: Number(process.env.LLAMA_PORT ?? 8080),
+	llamaModelAlias: process.env.LLAMA_MODEL_ALIAS,
 	localLlm,
 	llamaContextWindow: Number(process.env.LLAMA_CONTEXT_WINDOW ?? localLlmConfigs[localLlm].contextWindow),
 	llamaModelDir:
@@ -50,6 +51,8 @@ export const serverConfig = {
 	memoryFile: process.env.MEMORY_FILE ?? "data/memories.json",
 	usersFile: process.env.USERS_FILE ?? "data/users.json",
 	sessionsFile: process.env.SESSIONS_FILE ?? "data/sessions.json",
+	trafficFile: process.env.TRAFFIC_FILE ?? "data/traffic.json",
+	spotifyClientId: process.env.SPOTIFY_CLIENT_ID,
 	userMemoryDir: process.env.USER_MEMORY_DIR ?? "data/user-memories",
 	adminUser: process.env.ADMIN_USER ?? "admin",
 	adminPassword: process.env.ADMIN_PASSWORD ?? "admin",

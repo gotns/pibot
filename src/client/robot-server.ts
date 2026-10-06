@@ -7,6 +7,7 @@ import type {
 	RobotWireCancel,
 	RobotWireRequest,
 	ServerMessage,
+	SpotifyNowPlaying,
 } from "../types.js";
 import type { ClientLogger } from "./logger.js";
 import type { RobotToolHandlers } from "./tools/index.js";
@@ -31,6 +32,7 @@ const ttsFrameError = 4;
 export interface RobotServerEvents {
 	onState: (state: RobotState) => void;
 	onLog: (entry: LogEntry) => void;
+	onSpotifyPlayback: (playback: SpotifyNowPlaying | undefined) => void;
 	onRejected: (reason: string) => void;
 }
 
@@ -108,6 +110,10 @@ export class RobotServer {
 			this.events.onState(message.state);
 			return;
 		}
+		if (message.type === "spotify_playback") {
+			this.events.onSpotifyPlayback(message.playback);
+			return;
+		}
 		if (message.type === "log") this.events.onLog(message.entry);
 	}
 
@@ -165,7 +171,7 @@ export class RobotServer {
 	): Promise<RobotRpcMap[RobotRpcType]["response"]> {
 		if (message.request.type === "take_photo") return await this.tools.take_photo(message.request.payload, signal);
 		if (message.request.type === "motor") return await this.tools.motor(message.request.payload, signal);
-		if (message.request.type === "spotify") return await this.tools.spotify(message.request.payload, signal);
+		if (message.request.type === "radio") return await this.tools.radio(message.request.payload, signal);
 		if (message.request.type === "speak") return await this.tools.speak(message.request.payload, signal);
 		return await this.tools.cancel_speech(message.request.payload, signal);
 	}
@@ -193,11 +199,11 @@ export class RobotServer {
 			this.send({ type: "robot_response", id, requestType, error });
 			return;
 		}
-		if (requestType === "speak") {
+		if (requestType === "radio") {
 			this.send({ type: "robot_response", id, requestType, error });
 			return;
 		}
-		if (requestType === "spotify") {
+		if (requestType === "speak") {
 			this.send({ type: "robot_response", id, requestType, error });
 			return;
 		}

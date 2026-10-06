@@ -83,7 +83,7 @@ set(WHISPER_SDL2 OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   whisper_cpp
   GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
-  GIT_TAG master
+  GIT_TAG 3805e602d3a3f80ca13211cb96900eae5aad4d1d # pinned: later master adds its own "parakeet" target that clashes with parakeet.cpp
 )
 FetchContent_MakeAvailable(whisper_cpp)
 

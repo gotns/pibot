@@ -1,7 +1,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
-import type { SpotifyControlAction, SpotifyItemType, SpotifyRpcResponse } from "../../types.js";
-import type { RobotClient } from "../robot-client.js";
+import type { SpotifyControlAction, SpotifyItemType, SpotifyRpcRequest, SpotifyRpcResponse } from "../../types.js";
+
+export type SpotifyHandler = (payload: SpotifyRpcRequest, signal?: AbortSignal) => Promise<SpotifyRpcResponse>;
 
 const spotifyItemTypes = ["track", "album", "playlist", "audiobook", "show", "episode"] as const;
 const spotifyControlActions = ["pause", "resume", "next", "current"] as const;
@@ -60,7 +61,7 @@ function summarizeResponse(result: Exclude<SpotifyRpcResponse, { ok: false }>): 
 	return `Spotify ${result.action}.${title}${subtitle}.${state}`.trim();
 }
 
-export function createSpotifyTools(robot: RobotClient): AgentTool[] {
+export function createSpotifyTools(spotify: SpotifyHandler): AgentTool[] {
 	const search: AgentTool<typeof spotifySearchParameters, SpotifyRpcResponse> = {
 		name: "spotify_search",
 		label: "Spotify Search",
@@ -69,17 +70,10 @@ export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 		parameters: spotifySearchParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {
-			const result = await robot.execute({
-				type: "spotify",
-				payload: {
-					action: "search",
-					query: params.query,
-					itemType: parseItemType(params.itemType),
-					limit: params.limit,
-				},
-				timeoutMs: 15000,
+			const result = await spotify(
+				{ action: "search", query: params.query, itemType: parseItemType(params.itemType), limit: params.limit },
 				signal,
-			});
+			);
 			if (!result.ok) throw new Error(result.error);
 			return { content: [{ type: "text", text: summarizeResponse(result) }], details: result };
 		},
@@ -92,12 +86,7 @@ export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 		parameters: spotifyPlayParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {
-			const result = await robot.execute({
-				type: "spotify",
-				payload: { action: "play", uri: params.uri },
-				timeoutMs: 15000,
-				signal,
-			});
+			const result = await spotify({ action: "play", uri: params.uri }, signal);
 			if (!result.ok) throw new Error(result.error);
 			return { content: [{ type: "text", text: summarizeResponse(result) }], details: result };
 		},
@@ -110,12 +99,7 @@ export function createSpotifyTools(robot: RobotClient): AgentTool[] {
 		parameters: spotifyControlParameters,
 		executionMode: "sequential",
 		execute: async (_id, params, signal) => {
-			const result = await robot.execute({
-				type: "spotify",
-				payload: { action: parseControlAction(params.action) },
-				timeoutMs: 15000,
-				signal,
-			});
+			const result = await spotify({ action: parseControlAction(params.action) }, signal);
 			if (!result.ok) throw new Error(result.error);
 			return { content: [{ type: "text", text: summarizeResponse(result) }], details: result };
 		},

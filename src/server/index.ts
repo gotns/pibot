@@ -1,3 +1,4 @@
+import { dirname, join } from "node:path";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { RobotState, ServerMessage } from "../types.js";
@@ -8,10 +9,14 @@ import { createHttpServer } from "./http-server.js";
 import { createLlamaService, localLlmConfigs } from "./llama.js";
 import { createLogger, formatEntry } from "./logger.js";
 import { createFileMemoryStore } from "./memory-store.js";
+import { createRadioService } from "./radio.js";
 import { RobotClient } from "./robot-client.js";
 import { createSentenceChunker, type SentenceChunker } from "./sentence-chunker.js";
 import { onShutdown } from "./shutdown.js";
+import { createSpotifyService } from "./spotify.js";
 import { createSttService, type SttEvent } from "./stt.js";
+import type { MemoryStore } from "./tools/memory.js";
+import { createTrafficMeter } from "./traffic.js";
 import { createTtsService } from "./tts.js";
 import { attachWebSockets as createWebSocketServer, type WebsocketEvent } from "./websocket-server.js";
 
@@ -32,6 +37,8 @@ interface UserRuntime {
 	resolveSpeechPlaybackFinished: (() => void) | undefined;
 	bargeInActive: boolean;
 	activeToolState: { name: string; args: unknown } | undefined;
+	memoryStore: MemoryStore;
+	radioPlaying: boolean;
 }
 
 let sendToUser: (userId: string, message: ServerMessage) => void = () => undefined;
@@ -57,11 +64,14 @@ const auth = new UserAuthService({
 	secureCookies: serverConfig.secureCookies,
 });
 const userRuntimes = new Map<string, UserRuntime>();
+// Before anything fetches, so model downloads and LLM calls are counted too.
+const traffic = await createTrafficMeter({ file: serverConfig.trafficFile, logger });
 const localLlmConfig = localLlmConfigs[serverConfig.localLlm];
 const llama = await createLlamaService({
 	cacheDir: serverConfig.pibotCacheDir,
 	modelDir: serverConfig.llamaModelDir,
 	modelFile: localLlmConfig.modelFile,
+	modelAlias: serverConfig.llamaModelAlias,
 	mmprojFile: localLlmConfig.mmprojFile,
 	modelDownloadBaseUrl: localLlmConfig.downloadBaseUrl,
 	modelLabel: localLlmConfig.name,
@@ -89,22 +99,39 @@ const stt = createSttService({
 	logger,
 	onEvent: handleSttEvent,
 });
+const spotify = createSpotifyService({
+	fileForUser: (user) => join(auth.userMemoryDirForUser(user), "spotify.json"),
+	defaultClientId: serverConfig.spotifyClientId,
+	logger,
+});
+const radio = createRadioService({ logger });
 const http = createHttpServer({
 	publicDir: serverConfig.publicDir,
 	version: serverConfig.version,
 	auth,
+	spotify,
+	radio,
 });
+traffic.trackServer(http.server);
 const websockets = createWebSocketServer({
 	server: http.server,
+	onClientSocket: (socket, userId) => traffic.attributeToUser(socket, userId),
 	logger,
 	authenticate: (req) => auth.authenticateRequest(req),
 	onEvent: handleWebsocketEvent,
 });
 sendToUser = websockets.send;
 
-function createRuntimeBase(user: AuthenticatedUser, harness: RobotHarness, robot: RobotClient): UserRuntime {
+function createRuntimeBase(
+	user: AuthenticatedUser,
+	harness: RobotHarness,
+	robot: RobotClient,
+	memoryStore: MemoryStore,
+): UserRuntime {
 	return {
 		user,
+		memoryStore,
+		radioPlaying: false,
 		userId: user.name,
 		connected: false,
 		robot,
@@ -137,7 +164,18 @@ async function getUserRuntime(user: AuthenticatedUser): Promise<UserRuntime> {
 		localBaseUrl: serverConfig.llamaBaseUrl,
 		localContextWindow: serverConfig.llamaContextWindow,
 		maxContextImages: serverConfig.maxContextImages,
+		sessionsDir: join(dirname(user.memoryFile), "sessions"),
 		robot,
+		spotify: async (payload, signal) => {
+			const result = await spotify.handle(user.name, payload, signal);
+			// The browser shows what is playing; the API calls themselves no longer run there.
+			if (result.ok && result.action !== "search") {
+				sendToUser(user.name, { type: "spotify_playback", playback: result.title ? result : undefined });
+			}
+			return result;
+		},
+		spotifyConnected: async () => (await spotify.status(user.name)).connected,
+		radio,
 		onEvent: async (event) => {
 			if (!runtime?.connected) return;
 			await handleHarnessEvent(runtime, event);
@@ -147,7 +185,7 @@ async function getUserRuntime(user: AuthenticatedUser): Promise<UserRuntime> {
 			await waitForSpeechBeforeTool(runtime, name);
 		},
 	});
-	runtime = createRuntimeBase(user, harness, robot);
+	runtime = createRuntimeBase(user, harness, robot, memoryStore);
 	userRuntimes.set(user.name, runtime);
 	return runtime;
 }
@@ -168,33 +206,70 @@ function assistantText(runtime: UserRuntime): string {
 	return "assistantText" in runtime.state ? runtime.state.assistantText : "";
 }
 
-function looksLikeStopCommand(text: string): boolean {
-	const normalized = text
+const stopPhrases = [
+	"stop",
+	"stopp",
+	"halt",
+	"anhalten",
+	"abbrechen",
+	"schluss",
+	"ruhe",
+	"sei still",
+	"sei ruhig",
+	"hör auf",
+	"hoer auf",
+	"cancel",
+	"enough",
+	"be quiet",
+	"shut up",
+];
+
+function normalizeUtterance(text: string): string {
+	return text
 		.toLowerCase()
 		.normalize("NFKD")
 		.replace(/[.,!?;:()[\]{}"'`´]/g, " ")
 		.replace(/\s+/g, " ")
 		.trim();
+}
+
+function looksLikeStopCommand(text: string): boolean {
+	const normalized = normalizeUtterance(text);
 	if (!normalized) return false;
-	for (const phrase of [
-		"stop",
-		"stopp",
-		"halt",
-		"anhalten",
-		"abbrechen",
-		"schluss",
-		"ruhe",
-		"sei still",
-		"sei ruhig",
-		"hör auf",
-		"hoer auf",
-	]) {
+	for (const phrase of stopPhrases) {
 		if (normalized === phrase) return true;
 		if (normalized.startsWith(`${phrase} `)) return true;
 		if (normalized.endsWith(` ${phrase}`)) return true;
 		if (normalized.includes(` ${phrase} `)) return true;
 	}
 	return false;
+}
+
+// While the radio plays, the mic also hears the music. Only speech that addresses the robot (its name,
+// or the radio/music itself) becomes a prompt, so sung lyrics are not answered. A bare stop phrase stops
+// the radio directly; a stop word inside a longer utterance does not ("don't stop me now").
+async function handleFinalWhileRadioPlays(runtime: UserRuntime, text: string): Promise<void> {
+	const normalized = normalizeUtterance(text);
+	if (stopPhrases.includes(normalized)) {
+		sttLogger.log(`[${runtime.userId}] stop phrase while the radio plays: stopping the radio`);
+		setRobotState(runtime, { phase: "listening" });
+		await runtime.robot
+			.execute({ type: "radio", payload: { action: "stop" }, timeoutMs: 5000 })
+			.catch((error: unknown) => sttLogger.log(`[${runtime.userId}] radio stop failed: ${String(error)}`));
+		return;
+	}
+	const robotName = (await runtime.memoryStore.list())
+		.map((memory) => /\b(?:robot|roboter)\b.*?\b(?:is called|heißt)\s+([^\s.,!?]+)/i.exec(memory)?.[1])
+		.find(Boolean);
+	const addressed =
+		(robotName !== undefined && normalized.includes(normalizeUtterance(robotName))) ||
+		/\b(radio|music|station|song|volume|louder|quieter|softer)\b/.test(normalized);
+	if (!addressed) {
+		sttLogger.log(`[${runtime.userId}] ignored while the radio plays (not addressed): ${JSON.stringify(text)}`);
+		setRobotState(runtime, { phase: "listening" });
+		return;
+	}
+	submitPrompt(runtime, text);
 }
 
 function submitPrompt(runtime: UserRuntime, text: string): void {
@@ -215,7 +290,7 @@ async function runPrompt(runtime: UserRuntime, text: string, isContinuation: boo
 	setRobotState(runtime, { phase: "thinking", heardText: isContinuation ? undefined : text, assistantText: "" });
 	let message: AssistantMessage;
 	try {
-		message = await runtime.harness.current().prompt(text);
+		message = await runtime.harness.prompt(text);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (message.includes("busy")) {
@@ -235,7 +310,7 @@ async function runPrompt(runtime: UserRuntime, text: string, isContinuation: boo
 	agentLogger.log(`[${runtime.userId}] empty settled agent response; requesting continuation`);
 	await runPrompt(
 		runtime,
-		"Interne Fortsetzung: Deine letzte Antwort war leer. Antworte dem Nutzer jetzt kurz und hilfreich auf Deutsch. Wenn gerade ein Werkzeug ausgeführt wurde, bestätige knapp das Ergebnis. Rufe kein Werkzeug nur wegen dieser Fortsetzung auf.",
+		"Internal continuation: your last answer was empty. Answer the user now, briefly and helpfully, in English. If a tool was just executed, briefly confirm the result. Do not call a tool just because of this continuation.",
 		true,
 	);
 }
@@ -329,6 +404,10 @@ function handleSttEvent(event: SttEvent): void {
 		}
 		if (runtime.speechActive || Date.now() - runtime.lastSpeechEndedAt < 1500) {
 			setRobotState(runtime, { phase: "listening" });
+			return;
+		}
+		if (runtime.radioPlaying) {
+			void handleFinalWhileRadioPlays(runtime, event.text);
 			return;
 		}
 		submitPrompt(runtime, event.text);
@@ -520,6 +599,7 @@ async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 		tts.cancelUser(event.userId, "browser client disconnected");
 		finishSpeechPlayback(runtime, "browser client disconnected");
 		runtime.robot.rejectAll("Robot client disconnected");
+		runtime.radioPlaying = false;
 		return;
 	}
 	if (event.type === "client_message") {
@@ -545,6 +625,12 @@ async function handleWebsocketEvent(event: WebsocketEvent): Promise<void> {
 			finishSpeechPlayback(runtime, `client playback error: ${msg.message}`);
 			return;
 		}
+		if (msg.type === "radio_state") {
+			if (runtime.radioPlaying !== msg.playing)
+				agentLogger.log(`[${runtime.userId}] radio ${msg.playing ? "playing" : "off"}`);
+			runtime.radioPlaying = msg.playing;
+			return;
+		}
 		if (msg.type === "abort") await abortRobotTurn(runtime, "client abort");
 		if (msg.type === "barge_in") await handleBargeIn(runtime);
 		if (msg.type === "reset_session") {
@@ -562,6 +648,7 @@ onShutdown(async () => {
 	stt.stopChildProcess();
 	llama.stop();
 	for (const runtime of userRuntimes.values()) runtime.robot.stop();
+	await traffic.stop();
 	await logger.flush();
 });
 

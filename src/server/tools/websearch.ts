@@ -6,6 +6,8 @@ import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
 
 const braveApiKey = process.env.BRAVE_API_KEY;
+// One page fetch may add at most this many characters (~5k tokens) to the conversation.
+const maxPageChars = 20000;
 
 const webSearchParameters = Type.Object({
 	query: Type.String({ description: "Search query." }),
@@ -18,6 +20,9 @@ const webSearchParameters = Type.Object({
 
 const pageContentParameters = Type.Object({
 	url: Type.String({ description: "Absolute URL of the page to fetch and extract as readable markdown." }),
+	offset: Type.Optional(
+		Type.Number({ description: "Character offset to continue reading a long page from. Defaults to 0." }),
+	),
 });
 
 interface BraveSearchResult {
@@ -65,7 +70,7 @@ function htmlToMarkdown(html: string): string {
 }
 
 function formatSearchResults(details: WebSearchResultDetails): string {
-	if (details.results.length === 0) return `Keine Suchergebnisse für: ${details.query}`;
+	if (details.results.length === 0) return `No search results for: ${details.query}`;
 	return details.results
 		.map((result, index) => {
 			const age = result.age ? `\nAge: ${result.age}` : "";
@@ -87,8 +92,8 @@ async function searchWebWithBrave(
 	url.searchParams.set("q", query);
 	url.searchParams.set("count", String(resultCount));
 	url.searchParams.set("country", normalizedCountry);
-	url.searchParams.set("search_lang", "de");
-	url.searchParams.set("ui_lang", "de-DE");
+	url.searchParams.set("search_lang", "en");
+	url.searchParams.set("ui_lang", "en-US");
 	if (freshness) url.searchParams.set("freshness", freshness);
 	const response = await fetch(url, {
 		headers: {
@@ -167,14 +172,17 @@ export const webSearchTool: AgentTool<typeof webSearchParameters, WebSearchResul
 export const pageContentTool: AgentTool<typeof pageContentParameters, PageContentDetails> = {
 	name: "fetch_page_content",
 	label: "Fetch Page Content",
-	description: "Fetch readable markdown content from a specific URL found through web_search or provided by the user.",
+	description: `Fetch readable markdown content from a specific URL found through web_search or provided by the user. Returns at most ${maxPageChars} characters per call; long pages say which offset continues them.`,
 	executionMode: "sequential",
 	parameters: pageContentParameters,
 	execute: async (_id, params) => {
 		const result = await fetchPageContent(params.url);
-		return {
-			content: [{ type: "text", text: result.text || "No readable page content found." }],
-			details: result.details,
-		};
+		const offset = Math.max(0, Math.floor(params.offset ?? 0));
+		const end = offset + maxPageChars;
+		let text = result.text.slice(offset, end) || "No readable page content found.";
+		if (end < result.text.length) {
+			text += `\n\n[Page truncated: characters ${offset}-${end} of ${result.text.length}. Call fetch_page_content with offset ${end} to read more.]`;
+		}
+		return { content: [{ type: "text", text }], details: result.details };
 	},
 };

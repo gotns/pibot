@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { extname, relative, resolve } from "node:path";
 import type { UserAuthService } from "./auth.js";
+import type { RadioService } from "./radio.js";
+import type { SpotifyService } from "./spotify.js";
 
 export interface HttpServer {
 	server: Server;
@@ -87,7 +89,13 @@ function credentialsFromBody(body: unknown): { name: string; password: string } 
 	return { name: record.name, password: record.password };
 }
 
-export function createHttpServer(deps: { publicDir: string; version: string; auth: UserAuthService }): HttpServer {
+export function createHttpServer(deps: {
+	publicDir: string;
+	version: string;
+	auth: UserAuthService;
+	spotify: SpotifyService;
+	radio: RadioService;
+}): HttpServer {
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 		try {
@@ -123,6 +131,71 @@ export function createHttpServer(deps: { publicDir: string; version: string; aut
 					{ ok: true, user: { name: user.name } },
 					{ "set-cookie": deps.auth.sessionCookie(token) },
 				);
+				return;
+			}
+			// Relays plain-http radio streams that the https page may not load directly (mixed content).
+			if (url.pathname.startsWith("/api/radio/stream/") && req.method === "GET") {
+				if (!(await deps.auth.authenticateRequest(req))) {
+					sendJson(res, 401, { ok: false, error: "not authenticated" });
+					return;
+				}
+				await deps.radio.relay(decodeURIComponent(url.pathname.slice("/api/radio/stream/".length)), req, res);
+				return;
+			}
+			if (url.pathname.startsWith("/api/spotify/")) {
+				const user = await deps.auth.authenticateRequest(req);
+				if (!user) {
+					sendJson(res, 401, { ok: false, error: "not authenticated" });
+					return;
+				}
+				const route = `${req.method} ${url.pathname.slice("/api/spotify/".length)}`;
+				const body = (req.method === "POST" ? await readJson(req) : undefined) ?? {};
+				const field = (name: string): string | undefined => {
+					const value = (body as Record<string, unknown>)[name];
+					return typeof value === "string" ? value : undefined;
+				};
+				const spotify = deps.spotify;
+				if (route === "GET status") {
+					sendJson(res, 200, { ok: true, status: await spotify.status(user.name) });
+				} else if (route === "GET devices") {
+					await spotify.loadDevices(user.name);
+					sendJson(res, 200, { ok: true, status: await spotify.status(user.name) });
+				} else if (route === "GET token") {
+					sendJson(res, 200, { ok: true, accessToken: await spotify.accessToken(user.name) });
+				} else if (route === "POST client-id") {
+					await spotify.setClientId(user.name, field("clientId") ?? "");
+					sendJson(res, 200, { ok: true });
+				} else if (route === "POST login") {
+					const redirectUri = field("redirectUri");
+					if (!redirectUri?.startsWith("https://")) {
+						sendJson(res, 400, { ok: false, error: "redirectUri must be an https URL" });
+						return;
+					}
+					sendJson(res, 200, { ok: true, url: await spotify.beginLogin(user.name, redirectUri) });
+				} else if (route === "POST callback") {
+					await spotify.completeLogin(user.name, {
+						code: field("code"),
+						state: field("state"),
+						error: field("error"),
+					});
+					sendJson(res, 200, { ok: true });
+				} else if (route === "POST disconnect") {
+					await spotify.disconnect(user.name);
+					sendJson(res, 200, { ok: true });
+				} else if (route === "POST device") {
+					await spotify.selectDevice(user.name, field("deviceId"));
+					sendJson(res, 200, { ok: true });
+				} else if (route === "POST browser-player") {
+					const deviceId = field("deviceId");
+					if (!deviceId) {
+						sendJson(res, 400, { ok: false, error: "deviceId is required" });
+						return;
+					}
+					await spotify.useBrowserPlayer(user.name, deviceId);
+					sendJson(res, 200, { ok: true });
+				} else {
+					sendJson(res, 404, { ok: false, error: "not found" });
+				}
 				return;
 			}
 			if (url.pathname === "/api/logout" && req.method === "POST") {

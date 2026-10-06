@@ -35,7 +35,8 @@ export class SpotifyPanelElement extends HTMLElement {
 		title.textContent = "Spotify";
 
 		const help = document.createElement("p");
-		help.textContent = "Add this redirect URI in your Spotify app, paste the client ID, then connect.";
+		help.textContent =
+			"Add this redirect URI in your Spotify app, paste the client ID, then connect. The connection is saved on the server for your pibot account, so it works on every device you log in from.";
 
 		const redirectLabel = document.createElement("label");
 		redirectLabel.textContent = "Redirect URI";

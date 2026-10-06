@@ -43,6 +43,17 @@ export const localLlmConfigs = {
 		input: ["text", "image"],
 		chatTemplateKwargs: '{"enable_thinking":false}',
 	},
+	gemma12bqat: {
+		name: "Gemma 4 12B IT QAT Q4 llama.cpp Local",
+		modelFile: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+		mmprojFile: "mmproj-F16.gguf",
+		downloadBaseUrl: "https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF/resolve/main",
+		defaultModelDirName: "gemma-4-12b-it-qat",
+		contextWindow: 131072,
+		maxTokens: 16384,
+		input: ["text", "image"],
+		chatTemplateKwargs: '{"enable_thinking":false}',
+	},
 	gemma12b: {
 		name: "Gemma 4 12B IT Q4 llama.cpp Local",
 		modelFile: "gemma-4-12b-it-Q4_K_M.gguf",
@@ -62,14 +73,16 @@ export function parseLocalLlmId(value: string | undefined): LocalLlmId {
 	const normalized = value?.toLowerCase();
 	if (!normalized || normalized === "gemma") return "gemma";
 	if (normalized === "gemma12b" || normalized === "gemma-12b") return "gemma12b";
+	if (normalized === "gemma12bqat" || normalized === "gemma-12b-qat") return "gemma12bqat";
 	if (normalized === "qwen") return "qwen";
-	throw new Error(`Unknown LOCAL_LLM: ${value}. Expected qwen, gemma, or gemma12b.`);
+	throw new Error(`Unknown LOCAL_LLM: ${value}. Expected qwen, gemma, gemma12b, or gemma12bqat.`);
 }
 
 export interface LlamaServiceDeps {
 	cacheDir: string;
 	modelDir: string;
 	modelFile: string;
+	modelAlias?: string;
 	mmprojFile: string;
 	modelDownloadBaseUrl: string;
 	modelLabel: string;
@@ -235,7 +248,7 @@ export async function createLlamaService(deps: LlamaServiceDeps): Promise<LlamaS
 	const logger = deps.logger.tag("llama");
 	const existingServerInfo = await serverModelInfo(deps.baseUrl);
 	if (existingServerInfo) {
-		if (!modelInfoMatches(existingServerInfo, deps.modelFile, deps.contextWindow)) {
+		if (!modelInfoMatches(existingServerInfo, deps.modelAlias ?? deps.modelFile, deps.contextWindow)) {
 			throw new Error(`Found an incompatible server at ${deps.baseUrl}; stop it or set LLAMA_PORT/LLAMA_BASE_URL.`);
 		}
 		logger.log(`using existing llama.cpp server at ${deps.baseUrl}`);

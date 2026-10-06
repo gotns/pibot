@@ -34,6 +34,24 @@ export type SpotifyRpcResponse =
 	| ({ ok: true; action: Exclude<SpotifyAction, "search"> } & SpotifyNowPlaying)
 	| { ok: false; error: string };
 
+export interface RadioStation {
+	uuid: string;
+	name: string;
+	country?: string;
+	tags?: string;
+	favicon?: string;
+	codec?: string;
+	bitrate?: number;
+}
+
+export type RadioRpcRequest =
+	| { action: "play"; url: string; station: RadioStation }
+	| { action: "stop" | "pause" | "resume" | "louder" | "quieter" | "status" };
+
+export type RadioRpcResponse =
+	| { ok: true; playing: boolean; station?: RadioStation; volume: number }
+	| { ok: false; error: string };
+
 export type LogOrigin = "server" | "client";
 
 export interface LogEntry {
@@ -70,9 +88,9 @@ export interface RobotRpcMap {
 		request: { command: MotorCommand; durationMs: number; degrees?: number };
 		response: { ok: true } | { ok: false; error: string };
 	};
-	spotify: {
-		request: SpotifyRpcRequest;
-		response: SpotifyRpcResponse;
+	radio: {
+		request: RadioRpcRequest;
+		response: RadioRpcResponse;
 	};
 	speak: {
 		request: { url: string; text: string };
@@ -116,6 +134,7 @@ export interface RobotWireCancel {
 export type ServerMessage =
 	| { type: "state"; state: RobotState }
 	| { type: "log"; entry: LogEntry }
+	| { type: "spotify_playback"; playback: SpotifyNowPlaying | undefined }
 	| RobotWireRequest
 	| RobotWireCancel;
 
@@ -126,4 +145,5 @@ export type ClientMessage =
 	| { type: "reset_session" }
 	| { type: "tts_playback_done" }
 	| { type: "tts_playback_error"; message: string }
+	| { type: "radio_state"; playing: boolean }
 	| RobotWireResponse;
