@@ -1,4 +1,5 @@
 import type { RobotRpcMap } from "../../types.js";
+import { createCaptureNode } from "../audio-capture.js";
 import type { ClientLogger } from "../logger.js";
 
 const pcmInitialPrebufferSeconds = 0.4;
@@ -24,6 +25,11 @@ interface ActivePcmStream {
 	lastChunkWallTime: number | undefined;
 	underruns: number;
 	chunks: number;
+	// Set when the server sends Opus (WebCodecs); raw PCM streams never create one.
+	decoder: AudioDecoder | undefined;
+	opusPackets: number;
+	// First node speech chunks connect to: the clarity filter, or the output when it is off.
+	entry: AudioNode;
 }
 
 export interface SpeechTool {
@@ -39,7 +45,10 @@ export interface SpeechTool {
 		signal: AbortSignal,
 	) => RobotRpcMap["cancel_speech"]["response"];
 	startPcmStream: (sampleRate: number) => void;
+	setVoiceEffect: (enabled: boolean) => void;
+	unlock: () => void;
 	pushPcmAudio: (pcm: Uint8Array) => void;
+	pushOpusAudio: (packet: Uint8Array) => void;
 	finishPcmStream: () => Promise<void>;
 	failPcmStream: (message: string) => void;
 }
@@ -73,6 +82,10 @@ export function createSpeechTool(deps: {
 	let ttsGeneration = 0;
 	let activeSpeech: ActiveSpeech | undefined;
 	let activePcmStream: ActivePcmStream | undefined;
+	// Feeds played speech to the barge-in detector (its echo reference); one per audio context.
+	let playbackTap: Promise<AudioNode> | undefined;
+	// The clarity filter (EQ + compressor) on robot speech; off plays the voice untouched.
+	let voiceEffect = true;
 	function startFaceAmpLoop(analyser: AnalyserNode): () => void {
 		const data = new Uint8Array(analyser.fftSize);
 		let smoothed = 0;
@@ -211,6 +224,7 @@ export function createSpeechTool(deps: {
 		if (!stream) return;
 		stream.cleanup();
 		for (const node of stream.nodes) node.disconnect();
+		if (stream.decoder && stream.decoder.state !== "closed") stream.decoder.close();
 		if (resolveFinished) stream.finishResolve?.();
 	}
 
@@ -353,35 +367,35 @@ export function createSpeechTool(deps: {
 		const analyser = context.createAnalyser();
 		analyser.fftSize = 512;
 		analyser.smoothingTimeConstant = 0.55;
-		const playbackTap = context.createScriptProcessor(1024, 1, 1);
-		const silentTapOutput = context.createGain();
-		silentTapOutput.gain.value = 0;
-		playbackTap.onaudioprocess = (event) => {
-			const input = event.inputBuffer.getChannelData(0);
-			deps.onPlaybackAudio(input, event.inputBuffer.sampleRate);
-		};
+		playbackTap ??= createCaptureNode(context, deps.onPlaybackAudio);
 		highpass.connect(lowpass);
 		lowpass.connect(presence);
 		presence.connect(compressor);
 		compressor.connect(output);
 		output.connect(context.destination);
-		output.connect(playbackTap);
-		playbackTap.connect(silentTapOutput);
-		silentTapOutput.connect(context.destination);
 		output.connect(analyser);
-		activePcmStream = {
+		const stream: ActivePcmStream = {
 			generation: ++ttsGeneration,
 			sampleRate,
 			nextPlayTime: undefined,
 			pendingSources: 0,
 			doneRequested: false,
 			finishResolve: undefined,
-			nodes: [highpass, lowpass, presence, compressor, output, playbackTap, silentTapOutput, analyser],
+			nodes: [highpass, lowpass, presence, compressor, output, analyser],
 			cleanup: startFaceAmpLoop(analyser),
 			lastChunkWallTime: undefined,
 			underruns: 0,
 			chunks: 0,
+			decoder: undefined,
+			opusPackets: 0,
+			entry: voiceEffect ? highpass : output,
 		};
+		activePcmStream = stream;
+		void playbackTap
+			.then((tap) => {
+				if (activePcmStream === stream) output.connect(tap);
+			})
+			.catch((error: unknown) => logger.log(`playback tap unavailable: ${String(error)}`));
 		deps.onSpeakingChange(true);
 		deps.setMicInputBlockedUntil(0);
 		logger.log(`Qwen3 PCM stream started sampleRate=${sampleRate} prebufferMs=${pcmInitialPrebufferSeconds * 1000}`);
@@ -389,12 +403,46 @@ export function createSpeechTool(deps: {
 
 	function pushPcmAudio(pcm: Uint8Array): void {
 		const stream = activePcmStream;
-		if (!stream || !audioContext || pcm.byteLength < 2) return;
+		if (!stream || pcm.byteLength < 2) return;
 		const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-		const sampleCount = Math.floor(pcm.byteLength / 2);
-		const audioBuffer = audioContext.createBuffer(1, sampleCount, stream.sampleRate);
-		const channel = audioBuffer.getChannelData(0);
-		for (let index = 0; index < sampleCount; index++) channel[index] = view.getInt16(index * 2, true) / 32768;
+		const samples = new Float32Array(Math.floor(pcm.byteLength / 2));
+		for (let index = 0; index < samples.length; index++) samples[index] = view.getInt16(index * 2, true) / 32768;
+		scheduleSamples(stream, samples, stream.sampleRate, pcm.byteLength);
+	}
+
+	function pushOpusAudio(packet: Uint8Array): void {
+		const stream = activePcmStream;
+		if (!stream || packet.byteLength === 0) return;
+		if (!stream.decoder) {
+			const decoder = new AudioDecoder({
+				output: (data) => {
+					const samples = new Float32Array(data.numberOfFrames);
+					data.copyTo(samples, { planeIndex: 0, format: "f32-planar" });
+					const rate = data.sampleRate;
+					data.close();
+					if (activePcmStream === stream) scheduleSamples(stream, samples, rate, packet.byteLength);
+				},
+				error: (error) => logger.log(`Opus speech decoder error: ${error.message}`),
+			});
+			decoder.configure({ codec: "opus", sampleRate: stream.sampleRate, numberOfChannels: 1 });
+			stream.decoder = decoder;
+		}
+		const bytes = new Uint8Array(packet.byteLength);
+		bytes.set(packet);
+		stream.decoder.decode(
+			new EncodedAudioChunk({ type: "key", timestamp: stream.opusPackets++ * 20_000, data: bytes }),
+		);
+	}
+
+	function scheduleSamples(
+		stream: ActivePcmStream,
+		samples: Float32Array,
+		sampleRate: number,
+		wireBytes: number,
+	): void {
+		if (!audioContext || samples.length === 0) return;
+		const audioBuffer = audioContext.createBuffer(1, samples.length, sampleRate);
+		audioBuffer.getChannelData(0).set(samples);
 		const now = performance.now();
 		stream.chunks++;
 		const arrivalGapMs = stream.lastChunkWallTime === undefined ? 0 : now - stream.lastChunkWallTime;
@@ -404,12 +452,12 @@ export function createSpeechTool(deps: {
 		const queuedMs = (stream.nextPlayTime - audioContext.currentTime) * 1000;
 		if (stream.chunks === 1 || queuedMs < 50 || arrivalGapMs > 250) {
 			logger.log(
-				`Qwen3 PCM chunk #${stream.chunks} bytes=${pcm.byteLength} durationMs=${(audioBuffer.duration * 1000).toFixed(1)} queuedMs=${queuedMs.toFixed(1)} arrivalGapMs=${arrivalGapMs.toFixed(1)} pending=${stream.pendingSources}`,
+				`Qwen3 audio chunk #${stream.chunks} wireBytes=${wireBytes} durationMs=${(audioBuffer.duration * 1000).toFixed(1)} queuedMs=${queuedMs.toFixed(1)} arrivalGapMs=${arrivalGapMs.toFixed(1)} pending=${stream.pendingSources}`,
 			);
 		}
 		const source = audioContext.createBufferSource();
 		source.buffer = audioBuffer;
-		source.connect(stream.nodes[0] ?? audioContext.destination);
+		source.connect(stream.entry);
 		stream.pendingSources++;
 		source.onended = () => {
 			source.disconnect();
@@ -431,6 +479,11 @@ export function createSpeechTool(deps: {
 	async function finishPcmStream(): Promise<void> {
 		const stream = activePcmStream;
 		if (!stream) return;
+		// Opus: the last packets are still decoding; their audio must be scheduled before "done" counts.
+		if (stream.decoder?.state === "configured") {
+			await stream.decoder.flush().catch((error: unknown) => logger.log(`Opus flush failed: ${String(error)}`));
+		}
+		if (activePcmStream !== stream) return;
 		stream.doneRequested = true;
 		if (stream.pendingSources === 0) {
 			maybeFinishPcmStream(stream);
@@ -456,6 +509,15 @@ export function createSpeechTool(deps: {
 		handleCancelSpeech,
 		startPcmStream,
 		pushPcmAudio,
+		pushOpusAudio,
+		setVoiceEffect: (enabled: boolean) => {
+			voiceEffect = enabled;
+		},
+		// Call inside a tap: browsers only let audio start from a user gesture (voice previews on Home).
+		unlock: () => {
+			audioContext ??= new AudioContext();
+			void audioContext.resume();
+		},
 		finishPcmStream,
 		failPcmStream,
 	};

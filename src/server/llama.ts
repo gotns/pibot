@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { createWriteStream } from "node:fs";
-import { chmod, mkdir, rename, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { downloadFile } from "./download.js";
 import type { Logger } from "./logger.js";
 
 const LLAMA_CPP_RELEASE = "b9518";
@@ -98,12 +98,6 @@ export interface LlamaService {
 	stop: () => void;
 }
 
-interface DownloadFile {
-	url: string;
-	path: string;
-	label: string;
-}
-
 function llamaAssetName(): string {
 	if (process.platform === "darwin") {
 		if (process.arch === "arm64") return `llama-${LLAMA_CPP_RELEASE}-bin-macos-arm64.tar.gz`;
@@ -125,42 +119,6 @@ async function hasUsableFile(path: string): Promise<boolean> {
 		return (await stat(path)).size > 0;
 	} catch {
 		return false;
-	}
-}
-
-async function downloadFile(file: DownloadFile, logger: Logger): Promise<void> {
-	const tmpPath = `${file.path}.tmp-${process.pid}`;
-	await unlink(tmpPath).catch(() => undefined);
-	await mkdir(dirname(file.path), { recursive: true });
-	logger.log(`downloading ${file.label}`);
-	const response = await fetch(file.url);
-	if (!response.ok || !response.body) throw new Error(`failed to download ${file.label}: HTTP ${response.status}`);
-	const total = Number(response.headers.get("content-length") ?? "0");
-	const reader = response.body.getReader();
-	const output = createWriteStream(tmpPath, { flags: "wx" });
-	let received = 0;
-	let lastLog = Date.now();
-	try {
-		while (true) {
-			const chunk = await reader.read();
-			if (chunk.done) break;
-			received += chunk.value.byteLength;
-			if (!output.write(chunk.value)) await once(output, "drain");
-			if (Date.now() - lastLog > 5000) {
-				lastLog = Date.now();
-				const suffix = total > 0 ? ` / ${(total / 1024 / 1024).toFixed(1)} MiB` : "";
-				logger.log(`downloading ${file.label}: ${(received / 1024 / 1024).toFixed(1)} MiB${suffix}`);
-			}
-		}
-		output.end();
-		await once(output, "finish");
-		await rename(tmpPath, file.path);
-		const suffix = total > 0 ? ` / ${(total / 1024 / 1024).toFixed(1)} MiB` : "";
-		logger.log(`downloaded ${file.label}: ${(received / 1024 / 1024).toFixed(1)} MiB${suffix}`);
-	} catch (error) {
-		output.destroy();
-		await unlink(tmpPath).catch(() => undefined);
-		throw error;
 	}
 }
 
@@ -189,10 +147,7 @@ async function ensureLlamaBinary(cacheDir: string, logger: Logger): Promise<stri
 	const archivePath = join(archiveDir, assetName);
 	await mkdir(archiveDir, { recursive: true });
 	if (!(await hasUsableFile(archivePath))) {
-		await downloadFile(
-			{ url: `${LLAMA_CPP_BASE_URL}/${assetName}`, path: archivePath, label: `llama.cpp ${assetName}` },
-			logger,
-		);
+		await downloadFile(`${LLAMA_CPP_BASE_URL}/${assetName}`, archivePath, `llama.cpp ${assetName}`, logger);
 	}
 	logger.log(`extracting llama.cpp ${LLAMA_CPP_RELEASE}`);
 	await runCommand("tar", ["-xzf", archivePath, "-C", archiveDir], archiveDir, logger);
@@ -212,7 +167,7 @@ async function ensureLlamaModel(
 	for (const file of [modelFile, mmprojFile]) {
 		const path = join(modelDir, file);
 		if (await hasUsableFile(path)) continue;
-		await downloadFile({ url: `${modelDownloadBaseUrl}/${file}`, path, label: `${modelLabel} file ${file}` }, logger);
+		await downloadFile(`${modelDownloadBaseUrl}/${file}`, path, `${modelLabel} file ${file}`, logger);
 	}
 }
 

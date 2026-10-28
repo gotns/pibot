@@ -13,6 +13,11 @@ export type WebsocketEvent =
 	| { type: "audio_frame"; userId: string; data: Buffer }
 	| { type: "client_message"; userId: string; message: ClientMessage };
 
+// A connection replaced by a newer one from the same account closes with this code; the browser shows
+// "open on another device" instead of reconnecting (which would bump the new connection in turn).
+export const replacedCloseCode = 4000;
+const heartbeatIntervalMs = 10_000;
+
 export interface WebsocketServer {
 	send: (userId: string, message: object) => void;
 	broadcast: (message: object) => void;
@@ -33,6 +38,19 @@ export function attachWebSockets(deps: {
 		});
 	};
 	const robotWss = new WebSocketServer({ noServer: true });
+	// Dead sockets (phone asleep, network switched) never answer pings; terminate them so the close
+	// handlers run and the account can reconnect cleanly.
+	const alive = new Set<WebSocket>();
+	setInterval(() => {
+		for (const ws of clients.values()) {
+			if (!alive.has(ws)) {
+				ws.terminate();
+				continue;
+			}
+			alive.delete(ws);
+			ws.ping();
+		}
+	}, heartbeatIntervalMs).unref();
 	const reloadWss = new WebSocketServer({ noServer: true });
 
 	deps.server.on("upgrade", (req, socket, head) => {
@@ -63,16 +81,19 @@ export function attachWebSockets(deps: {
 			return;
 		}
 		const userId = user.name;
+		// Newest connection wins: a phone that switched networks may still look connected for minutes.
 		const existingClient = clients.get(userId);
-		if (existingClient?.readyState === WebSocket.OPEN) {
-			logger.log(`rejected extra ws client for ${userId}`);
-			ws.close(1008, "This user is already connected");
-			return;
-		}
 		clients.set(userId, ws);
+		if (existingClient && existingClient.readyState !== WebSocket.CLOSED) {
+			logger.log(`new ws client for ${userId} replaces the previous one`);
+			existingClient.close(replacedCloseCode, "pibot was opened on another device");
+		}
+		alive.add(ws);
+		ws.on("pong", () => alive.add(ws));
 		deps.onClientSocket(req.socket, userId);
 		emit({ type: "client_connected", client: ws, user, userId });
 		ws.on("message", (data, isBinary) => {
+			if (clients.get(userId) !== ws) return;
 			try {
 				if (isBinary) {
 					emit({
@@ -88,7 +109,10 @@ export function attachWebSockets(deps: {
 			}
 		});
 		ws.on("close", () => {
-			if (clients.get(userId) === ws) clients.delete(userId);
+			alive.delete(ws);
+			// A replaced connection closing must not tear down the state of the one that replaced it.
+			if (clients.get(userId) !== ws) return;
+			clients.delete(userId);
 			emit({ type: "client_disconnected", client: ws, userId });
 		});
 	});

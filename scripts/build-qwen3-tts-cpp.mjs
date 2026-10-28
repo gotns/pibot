@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 
 function run(command, args) {
 	return new Promise((resolve, reject) => {
@@ -34,6 +35,13 @@ if (process.platform === "darwin") {
 }
 
 await run("npm", ["run", "submodules", "--", "native/qwen3-tts.cpp"]);
+
+// pibot's own changes to the worker (per-request voices) are kept as a patch here, because the submodule
+// points at an upstream repository. Applied once; skipped when the tree already contains it.
+const voicesPatch = resolve("native/patches/qwen3-tts-voices.patch");
+const alreadyApplied =
+	spawnSync("git", ["-C", "native/qwen3-tts.cpp", "apply", "--reverse", "--check", voicesPatch]).status === 0;
+if (!alreadyApplied) await run("git", ["-C", "native/qwen3-tts.cpp", "apply", voicesPatch]);
 await run("cmake", ggmlArgs);
 await run("cmake", ["--build", "native/qwen3-tts.cpp/ggml/build", "-j"]);
 await run("cmake", ["-S", "native/qwen3-tts.cpp", "-B", "native/qwen3-tts.cpp/build", "-DQWEN3_TTS_COREML=OFF"]);

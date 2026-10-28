@@ -52,6 +52,7 @@ export const serverConfig = {
 	usersFile: process.env.USERS_FILE ?? "data/users.json",
 	sessionsFile: process.env.SESSIONS_FILE ?? "data/sessions.json",
 	trafficFile: process.env.TRAFFIC_FILE ?? "data/traffic.json",
+	conversationsToKeep: Number(process.env.CONVERSATIONS_KEEP ?? 100),
 	spotifyClientId: process.env.SPOTIFY_CLIENT_ID,
 	userMemoryDir: process.env.USER_MEMORY_DIR ?? "data/user-memories",
 	adminUser: process.env.ADMIN_USER ?? "admin",

@@ -15,6 +15,8 @@ const fallbackServers = ["de1.api.radio-browser.info"];
 // Formats every browser plays from a plain <audio> element. HLS and OGG are skipped (Safari, Chrome).
 const playableCodecs = new Set(["MP3", "AAC", "AAC+"]);
 const maxRedirects = 3;
+// Relayed streams use the box's bandwidth; a listener needs one at a time (two covers a station switch).
+const maxRelaysPerUser = 2;
 
 interface RadioBrowserStation {
 	stationuuid: string;
@@ -37,7 +39,7 @@ export interface RadioService {
 		limit: number;
 	}) => Promise<RadioStation[]>;
 	prepare: (uuid: string) => Promise<{ station: RadioStation; url: string }>;
-	relay: (uuid: string, req: IncomingMessage, res: ServerResponse) => Promise<void>;
+	relay: (uuid: string, user: string, req: IncomingMessage, res: ServerResponse) => Promise<void>;
 }
 
 function toStation(entry: RadioBrowserStation): RadioStation {
@@ -55,6 +57,7 @@ function toStation(entry: RadioBrowserStation): RadioStation {
 export function createRadioService(deps: { logger: Logger }): RadioService {
 	const logger = deps.logger.tag("radio");
 	const stations = new Map<string, RadioBrowserStation>();
+	const relays = new Map<string, ServerResponse[]>();
 	let servers: string[] | undefined;
 
 	// Radio Browser asks clients to find mirrors via DNS and spread load across them.
@@ -140,8 +143,16 @@ export function createRadioService(deps: { logger: Logger }): RadioService {
 				url: url.startsWith("https://") ? url : `/api/radio/stream/${encodeURIComponent(uuid)}`,
 			};
 		},
-		relay: async (uuid, req, res) => {
+		relay: async (uuid, user, req, res) => {
 			const entry = await station(uuid);
+			const active = relays.get(user) ?? [];
+			while (active.length >= maxRelaysPerUser) active.shift()?.destroy();
+			active.push(res);
+			relays.set(user, active);
+			res.once("close", () => {
+				const index = active.indexOf(res);
+				if (index >= 0) active.splice(index, 1);
+			});
 			const controller = new AbortController();
 			req.once("close", () => controller.abort());
 			let url = new URL(entry.url_resolved ?? "");

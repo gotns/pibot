@@ -1,0 +1,73 @@
+diff --git a/src/worker_main.cpp b/src/worker_main.cpp
+index e9ca120..e29ef46 100644
+--- a/src/worker_main.cpp
++++ b/src/worker_main.cpp
+@@ -20,6 +20,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <iterator>
++#include <map>
+ #include <mutex>
+ #include <queue>
+ #include <string>
+@@ -34,6 +35,9 @@ namespace {
+ constexpr uint8_t WORKER_INPUT_SPEAK = 1;
+ constexpr uint8_t WORKER_INPUT_CANCEL = 2;
+ constexpr uint8_t WORKER_INPUT_SHUTDOWN = 3;
++// Payload: path of a reference WAV. Switches the speaker for all following SPEAK requests; embeddings are
++// cached per path, so switching back is free. Failure leaves the previous voice and answers with an error.
++constexpr uint8_t WORKER_INPUT_SET_VOICE = 4;
+ constexpr uint8_t WORKER_OUTPUT_READY = 1;
+ constexpr uint8_t WORKER_OUTPUT_AUDIO_START = 2;
+ constexpr uint8_t WORKER_OUTPUT_AUDIO_CHUNK = 3;
+@@ -313,6 +317,29 @@ public:
+ 
+     const std::string & error() const { return error_; }
+ 
++    bool set_voice(const std::string & path) {
++        auto cached = voices_.find(path);
++        if (cached != voices_.end()) {
++            embedding_ = cached->second;
++            return true;
++        }
++        std::vector<float> samples;
++        int rate = 0;
++        if (!qwen3_tts::load_audio_file(path, samples, rate)) {
++            error_ = "failed to load voice reference: " + path;
++            return false;
++        }
++        if (rate != 24000) samples = resample_linear(samples, rate, 24000);
++        std::vector<float> embedding;
++        if (!tts_.extract_speaker_embedding(samples.data(), (int32_t)samples.size(), embedding, params_)) {
++            error_ = "failed to extract speaker embedding for " + path + ": " + tts_.get_error();
++            return false;
++        }
++        voices_[path] = embedding;
++        embedding_ = std::move(embedding);
++        return true;
++    }
++
+     // Generate once to a WAV file (non-serve mode, for testing).
+     bool generate_once() {
+         std::string text = args_.text;
+@@ -397,6 +424,7 @@ private:
+     qwen3_tts::Qwen3TTS tts_;
+     qwen3_tts::tts_params params_;
+     std::vector<float> embedding_;
++    std::map<std::string, std::vector<float>> voices_;
+     int model_sample_rate_ = 24000;
+     std::string error_;
+ };
+@@ -447,6 +475,12 @@ int serve(Worker & worker, BinaryWriter & writer) {
+             worker.handle_speak(frame.request_id, frame.payload, writer, cancel_mu, cancelled);
+             std::lock_guard<std::mutex> lock(cancel_mu);
+             cancelled.erase(frame.request_id);
++        } else if (frame.type == WORKER_INPUT_SET_VOICE) {
++            std::string path(frame.payload.begin(), frame.payload.end());
++            if (!worker.set_voice(path)) {
++                const std::string & msg = worker.error();
++                writer.write_frame(WORKER_OUTPUT_ERROR, frame.request_id, (const uint8_t *)msg.data(), msg.size());
++            }
+         } else {
+             std::string msg = "unknown frame type " + std::to_string((int)frame.type);
+             writer.write_frame(WORKER_OUTPUT_ERROR, frame.request_id, (const uint8_t *)msg.data(), msg.size());

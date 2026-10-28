@@ -8,6 +8,8 @@ function tagColor(tag: string): string {
 	return tagColors[Math.abs(hash) % tagColors.length]!;
 }
 
+const maxLines = 400;
+
 export class RobotLogElement extends HTMLElement {
 	private autoScroll = true;
 
@@ -37,6 +39,8 @@ export class RobotLogElement extends HTMLElement {
 		line.append(` ${message}`);
 		line.className = displayTags.join(" ");
 		this.append(line);
+		// Every line is a DOM node; hours of use would otherwise slow a phone down.
+		while (this.childElementCount > maxLines) this.firstElementChild?.remove();
 		if (shouldScroll) this.scrollTop = this.scrollHeight;
 	}
 }

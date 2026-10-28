@@ -1,5 +1,5 @@
-import { randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -10,6 +10,17 @@ const persistentCookieExpires = "Fri, 31 Dec 9999 23:59:59 GMT";
 const usernamePattern = /^[a-z0-9_-]{1,32}$/;
 const passwordHashPrefix = "scrypt";
 const scryptKeyLength = 32;
+// A login expires after this long without use; each use pushes it forward (saved at most hourly).
+const sessionIdleLimitMs = 90 * 24 * 60 * 60 * 1000;
+const sessionTouchIntervalMs = 60 * 60 * 1000;
+
+// Write to a temp file and rename, so a crash mid-save cannot leave a truncated users/sessions file
+// (which would lock every account out). Owner-only: these hold password hashes and login tokens.
+async function writeFileAtomic(path: string, content: string): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(`${path}.tmp`, content, { mode: 0o600 });
+	await rename(`${path}.tmp`, path);
+}
 
 export interface PublicUser {
 	name: string;
@@ -34,6 +45,7 @@ interface SessionRecord {
 	token: string;
 	name: string;
 	createdAt: string;
+	lastSeenAt?: string;
 }
 
 interface SessionsFile {
@@ -126,6 +138,8 @@ export class UserAuthService {
 			existing.passwordHash = await hashPassword(password);
 			existing.updatedAt = now;
 			await this.saveUsers();
+			// A new password must end every login made with the old one.
+			await this.revokeSessions(normalized);
 			return publicUser(existing);
 		}
 		const record: UserRecord = { name: normalized, passwordHash: await hashPassword(password), createdAt: now };
@@ -149,6 +163,31 @@ export class UserAuthService {
 		await this.saveUsers();
 		await rm(this.userMemoryDirForUser(normalized), { recursive: true, force: true });
 		return true;
+	}
+
+	async changePassword(name: string, currentPassword: string, newPassword: string, keepToken: string): Promise<void> {
+		const normalized = normalizeUsername(name);
+		const user = (await this.loadUsers()).find((entry) => entry.name === normalized);
+		if (!user || !(await verifyPassword(currentPassword, user.passwordHash))) {
+			throw new Error("The current password is not correct.");
+		}
+		if (newPassword.length < 8) throw new Error("The new password must have at least 8 characters.");
+		user.passwordHash = await hashPassword(newPassword);
+		user.updatedAt = new Date().toISOString();
+		await this.saveUsers();
+		await this.revokeSessions(normalized, keepToken);
+	}
+
+	sessionToken(req: IncomingMessage): string | undefined {
+		return parseCookies(req.headers.cookie).get(sessionCookieName);
+	}
+
+	private async revokeSessions(name: string, keepToken?: string): Promise<void> {
+		const sessions = await this.loadSessions();
+		for (const [token, session] of sessions) {
+			if (session.name === name && token !== keepToken) sessions.delete(token);
+		}
+		await this.saveSessions();
 	}
 
 	async verifyUser(name: string, password: string): Promise<AuthenticatedUser | undefined> {
@@ -190,6 +229,16 @@ export class UserAuthService {
 		const sessions = await this.loadSessions();
 		const session = sessions.get(token);
 		if (!session) return undefined;
+		const lastSeen = Date.parse(session.lastSeenAt ?? session.createdAt);
+		if (Date.now() - lastSeen > sessionIdleLimitMs) {
+			sessions.delete(token);
+			await this.saveSessions();
+			return undefined;
+		}
+		if (Date.now() - lastSeen > sessionTouchIntervalMs) {
+			session.lastSeenAt = new Date().toISOString();
+			await this.saveSessions();
+		}
 		const users = await this.loadUsers();
 		if (!users.some((user) => user.name === session.name)) {
 			sessions.delete(token);
@@ -207,7 +256,11 @@ export class UserAuthService {
 		if (separator < 0) return false;
 		const name = decoded.slice(0, separator);
 		const password = decoded.slice(separator + 1);
-		return name === this.options.adminUser && password === this.options.adminPassword;
+		// Compare digests in constant time so response timing reveals nothing about the password.
+		const digest = (value: string) => createHash("sha256").update(value).digest();
+		const nameOk = timingSafeEqual(digest(name), digest(this.options.adminUser));
+		const passwordOk = timingSafeEqual(digest(password), digest(this.options.adminPassword));
+		return nameOk && passwordOk;
 	}
 
 	private async loadUsers(): Promise<UserRecord[]> {
@@ -263,12 +316,10 @@ export class UserAuthService {
 
 	private async saveSessions(): Promise<void> {
 		const sessions = this.sessions ? [...this.sessions.values()] : [];
-		await mkdir(dirname(this.options.sessionsFile), { recursive: true });
-		await writeFile(this.options.sessionsFile, `${JSON.stringify({ sessions }, null, "\t")}\n`);
+		await writeFileAtomic(this.options.sessionsFile, `${JSON.stringify({ sessions }, null, "\t")}\n`);
 	}
 
 	private async saveUsers(): Promise<void> {
-		await mkdir(dirname(this.options.usersFile), { recursive: true });
-		await writeFile(this.options.usersFile, `${JSON.stringify({ users: this.users ?? [] }, null, "\t")}\n`);
+		await writeFileAtomic(this.options.usersFile, `${JSON.stringify({ users: this.users ?? [] }, null, "\t")}\n`);
 	}
 }

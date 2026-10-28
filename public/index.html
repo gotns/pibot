@@ -2,41 +2,70 @@
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 		<meta http-equiv="Cache-Control" content="no-store" />
 		<meta http-equiv="Pragma" content="no-cache" />
+		<meta name="theme-color" content="#05070b" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<meta name="apple-mobile-web-app-title" content="pibot" />
+		<link rel="manifest" href="manifest.webmanifest" />
+		<link rel="icon" href="icon.svg" type="image/svg+xml" />
+		<link rel="apple-touch-icon" href="icon-192.png" />
 		<title>Pipi</title>
 		<link rel="stylesheet" href="style.css?v=dev" />
 	</head>
 	<body>
+		<div id="banners" class="banners" aria-live="polite"></div>
 		<section id="auth" class="auth-panel">
-			<h1>Pipi</h1>
-			<p>Sign in to use the robot.</p>
+			<h1>pibot</h1>
+			<p>Sign in to talk to your robot.</p>
 			<form id="loginForm" class="panel">
 				<label>
 					Name
-					<input id="loginName" name="name" autocomplete="username" required />
+					<input id="loginName" name="name" autocomplete="username" autocapitalize="none" required />
 				</label>
 				<label>
 					Password
 					<input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
 				</label>
-				<button class="primary" type="submit">sign in</button>
+				<button class="primary" type="submit">Sign in</button>
 				<p id="loginError" class="error-text"></p>
 			</form>
 		</section>
 		<section id="setup" hidden>
-			<h1>Pipi</h1>
-			<p>Phone-powered robot.</p>
+			<header class="home-header">
+				<h1 id="robotName">Pipi</h1>
+				<p id="homeSubtitle">Your voice assistant</p>
+			</header>
 			<div id="setupFaceHost" class="setup-face-host"></div>
 			<robot-setup-panel id="setupPanel"></robot-setup-panel>
+			<pibot-conversations id="conversationsPanel" hidden></pibot-conversations>
+			<pibot-settings id="settingsPanel" hidden></pibot-settings>
 			<spotify-panel id="spotifyPanel" hidden></spotify-panel>
-			<robot-log id="log"></robot-log>
+			<robot-log id="log" hidden></robot-log>
 		</section>
 		<section id="robot" hidden>
 			<robot-face-webgl id="face" state="inactive"></robot-face-webgl>
+			<talk-captions id="captions"></talk-captions>
 			<div id="spotifyNowPlaying" class="spotify-now-playing" hidden></div>
-			<button id="back">setup</button>
+			<div class="talk-bar">
+				<button id="micModeButton" type="button" class="mic-mode"></button>
+				<button id="pttButton" type="button" class="ptt" hidden>Hold to talk</button>
+				<form id="textForm" class="text-form">
+					<input
+						id="textInput"
+						type="text"
+						enterkeyhint="send"
+						autocomplete="off"
+						placeholder="Type a message"
+						aria-label="Type a message"
+					/>
+					<button type="submit">Send</button>
+				</form>
+			</div>
+			<button id="back" type="button">Home</button>
 		</section>
 		<script src="app.js?v=dev"></script>
 	</body>

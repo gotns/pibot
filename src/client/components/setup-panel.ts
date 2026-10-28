@@ -1,41 +1,56 @@
 export type SetupPanelMode = "idle" | "starting" | "started";
 
+// The home screen's buttons: talk, past conversations, settings, logout.
 export class RobotSetupPanelElement extends HTMLElement {
 	private startButton: HTMLButtonElement | undefined;
-	private spotifyButton: HTMLButtonElement | undefined;
-	private resetButton: HTMLButtonElement | undefined;
-	private logoutButton: HTMLButtonElement | undefined;
+	private name = "Pipi";
+	private currentMode: SetupPanelMode = "idle";
 
 	connectedCallback(): void {
 		if (!this.startButton) this.render();
 	}
 
 	set mode(mode: SetupPanelMode) {
+		this.currentMode = mode;
+		this.updateStart();
+	}
+
+	set robotName(name: string) {
+		this.name = name;
+		this.updateStart();
+	}
+
+	private updateStart(): void {
 		if (!this.startButton) return;
-		this.startButton.disabled = mode === "starting";
+		this.startButton.disabled = this.currentMode === "starting";
 		this.startButton.textContent =
-			mode === "starting" ? "Starting..." : mode === "started" ? "Show face" : "Start robot";
+			this.currentMode === "starting"
+				? "Starting..."
+				: this.currentMode === "started"
+					? `Back to ${this.name}`
+					: `Talk to ${this.name}`;
 	}
 
 	private render(): void {
 		this.classList.add("panel");
 		this.startButton = document.createElement("button");
 		this.startButton.className = "primary";
-		this.startButton.textContent = "Start robot";
 		this.startButton.addEventListener("click", () => this.dispatchEvent(new Event("start-robot")));
-
+		this.updateStart();
 		const controls = document.createElement("div");
 		controls.className = "controls";
-		this.spotifyButton = document.createElement("button");
-		this.spotifyButton.textContent = "Spotify";
-		this.spotifyButton.addEventListener("click", () => this.dispatchEvent(new Event("spotify-setup")));
-		this.resetButton = document.createElement("button");
-		this.resetButton.textContent = "Reset session";
-		this.resetButton.addEventListener("click", () => this.dispatchEvent(new Event("reset-session")));
-		this.logoutButton = document.createElement("button");
-		this.logoutButton.textContent = "Logout";
-		this.logoutButton.addEventListener("click", () => this.dispatchEvent(new Event("logout")));
-		controls.append(this.spotifyButton, this.resetButton, this.logoutButton);
+		const button = (label: string, event: string) => {
+			const element = document.createElement("button");
+			element.type = "button";
+			element.textContent = label;
+			element.addEventListener("click", () => this.dispatchEvent(new Event(event)));
+			return element;
+		};
+		controls.append(
+			button("Conversations", "open-conversations"),
+			button("Settings", "open-settings"),
+			button("Logout", "logout"),
+		);
 		this.replaceChildren(this.startButton, controls);
 	}
 }

@@ -16,6 +16,9 @@ export interface RadioTool {
 	unlock: () => void;
 	setDucked: (ducked: boolean) => void;
 	isPlaying: () => boolean;
+	isPaused: () => boolean;
+	volume: () => number;
+	setVolume: (value: number) => void;
 	stop: () => void;
 	handle: (payload: RadioRpcRequest, signal: AbortSignal) => Promise<RadioRpcResponse>;
 }
@@ -139,6 +142,17 @@ export function createRadioTool(deps: {
 			applyVolume();
 		},
 		isPlaying,
+		isPaused: () => Boolean(station) && audio.paused,
+		volume: () => volume,
+		setVolume: (value) => {
+			volume = clampVolume(value);
+			applyVolume();
+			try {
+				localStorage.setItem(volumeKey, String(volume));
+			} catch {
+				// storage unavailable: volume still applies for this page
+			}
+		},
 		stop,
 		handle,
 	};

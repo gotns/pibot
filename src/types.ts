@@ -135,6 +135,8 @@ export type ServerMessage =
 	| { type: "state"; state: RobotState }
 	| { type: "log"; entry: LogEntry }
 	| { type: "spotify_playback"; playback: SpotifyNowPlaying | undefined }
+	// What the recognizer hears so far, for live captions.
+	| { type: "interim"; text: string }
 	| RobotWireRequest
 	| RobotWireCancel;
 
@@ -146,4 +148,12 @@ export type ClientMessage =
 	| { type: "tts_playback_done" }
 	| { type: "tts_playback_error"; message: string }
 	| { type: "radio_state"; playing: boolean }
+	// Sent on every (re)connect: how mic audio arrives and how robot speech should be sent.
+	| { type: "audio_format"; uplink: "pcm16" | "opus"; downlink: "pcm16" | "opus" }
+	// Ends the current utterance now (push-to-talk release, mic gate closing).
+	| { type: "mic_flush" }
+	// Typed instead of spoken.
+	| { type: "text_prompt"; text: string }
+	// Speak a sample sentence with this voice (settings sheet).
+	| { type: "preview_voice"; voice: string }
 	| RobotWireResponse;

@@ -1,12 +1,14 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { once } from "node:events";
-import { createWriteStream, type Dirent, existsSync } from "node:fs";
-import { mkdir, readdir, rename, stat, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { type Dirent, existsSync } from "node:fs";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { join } from "node:path";
+import { downloadFile } from "./download.js";
 import type { Logger } from "./logger.js";
 
 const workerInputSpeak = 1;
 const workerInputShutdown = 3;
+// Payload: reference WAV path; switches the cloned voice for the requests that follow (C++ worker only).
+const workerInputSetVoice = 4;
 const workerOutputReady = 1;
 const workerOutputAudioStart = 2;
 const workerOutputAudioChunk = 3;
@@ -47,7 +49,8 @@ export interface TtsCallbacks {
 
 export interface TtsService {
 	ready: Promise<void>;
-	start: (userId: string, callbacks: TtsCallbacks) => void;
+	start: (userId: string, callbacks: TtsCallbacks, voicePath?: string) => void;
+	defaultVoicePath: string;
 	pushText: (userId: string, text: string) => void;
 	end: (userId: string) => void;
 	cancelUser: (userId: string, reason: string) => void;
@@ -59,6 +62,7 @@ interface QueuedRequest {
 	id: number;
 	userId: string;
 	text: string;
+	voicePath: string;
 }
 
 interface ActiveRequest extends QueuedRequest {
@@ -67,16 +71,11 @@ interface ActiveRequest extends QueuedRequest {
 
 interface TtsTurn {
 	callbacks: TtsCallbacks;
+	voicePath: string;
 	pendingRequests: number;
 	turnEnded: boolean;
 	streamStarted: boolean;
 	cancelled: boolean;
-}
-
-interface DownloadFile {
-	url: string;
-	path: string;
-	label: string;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -157,42 +156,6 @@ async function listHuggingFaceFiles(repo: string): Promise<string[]> {
 	return files;
 }
 
-async function downloadFile(file: DownloadFile, logger: Logger): Promise<void> {
-	const tmpPath = `${file.path}.tmp-${process.pid}`;
-	await unlink(tmpPath).catch(() => undefined);
-	await mkdir(dirname(file.path), { recursive: true });
-	logger.log(`downloading ${file.label}`);
-	const response = await fetch(file.url);
-	if (!response.ok || !response.body) throw new Error(`failed to download ${file.label}: HTTP ${response.status}`);
-	const total = Number(response.headers.get("content-length") ?? "0");
-	const reader = response.body.getReader();
-	const output = createWriteStream(tmpPath, { flags: "wx" });
-	let received = 0;
-	let lastLog = Date.now();
-	try {
-		while (true) {
-			const chunk = await reader.read();
-			if (chunk.done) break;
-			received += chunk.value.byteLength;
-			if (!output.write(chunk.value)) await once(output, "drain");
-			if (Date.now() - lastLog > 5000) {
-				lastLog = Date.now();
-				const suffix = total > 0 ? ` / ${(total / 1024 / 1024).toFixed(1)} MiB` : "";
-				logger.log(`downloading ${file.label}: ${(received / 1024 / 1024).toFixed(1)} MiB${suffix}`);
-			}
-		}
-		output.end();
-		await once(output, "finish");
-		await rename(tmpPath, file.path);
-		const suffix = total > 0 ? ` / ${(total / 1024 / 1024).toFixed(1)} MiB` : "";
-		logger.log(`downloaded ${file.label}: ${(received / 1024 / 1024).toFixed(1)} MiB${suffix}`);
-	} catch (error) {
-		output.destroy();
-		await unlink(tmpPath).catch(() => undefined);
-		throw error;
-	}
-}
-
 async function cleanupStaleDownloads(dir: string): Promise<void> {
 	let entries: Dirent[];
 	try {
@@ -226,7 +189,7 @@ async function ensureHuggingFaceModel(
 	for (const file of files) {
 		const path = join(modelDir, file);
 		if (await hasUsableFile(path)) continue;
-		await downloadFile({ url: huggingFaceFileUrl(repo, file), path, label: `${label} model file ${file}` }, logger);
+		await downloadFile(huggingFaceFileUrl(repo, file), path, `${label} model file ${file}`, logger);
 	}
 
 	if (!(await hasRequiredModelFiles(modelDir, requiredFiles))) {
@@ -260,6 +223,12 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	let activeRequest: ActiveRequest | undefined;
 	let resolveReady: (() => void) | undefined;
 	let rejectReady: ((error: Error) => void) | undefined;
+	let stopping = false;
+	let restartAttempts = 0;
+	// The voice the worker currently speaks with; it starts with the --ref-audio voice.
+	let workerVoicePath = qwen3RefAudio;
+	const voiceRequestIds = new Map<number, string>();
+	const restartDelaysMs = [1000, 2000, 5000, 10000, 30000];
 
 	const ready = new Promise<void>((resolve, reject) => {
 		resolveReady = resolve;
@@ -304,6 +273,12 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		lastServedUserId = request.userId;
 		activeRequest = { ...request, cancelled: false };
 		try {
+			if (workerKind === "cpp" && request.voicePath !== workerVoicePath) {
+				const voiceRequestId = nextRequestId++;
+				voiceRequestIds.set(voiceRequestId, request.voicePath);
+				sendFrame(workerInputSetVoice, voiceRequestId, textEncoder.encode(request.voicePath));
+				workerVoicePath = request.voicePath;
+			}
 			sendFrame(workerInputSpeak, request.id, textEncoder.encode(request.text));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -316,8 +291,17 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	function handleWorkerFrame(type: number, id: number, payload: Uint8Array): void {
 		if (type === workerOutputReady) {
 			qwen3Logger.log("ready");
+			restartAttempts = 0;
 			resolveReady?.();
 			resolveReady = undefined;
+			return;
+		}
+		const failedVoice = voiceRequestIds.get(id);
+		if (failedVoice !== undefined) {
+			// The worker kept its previous voice; make the next request for this voice try again.
+			voiceRequestIds.delete(id);
+			logger.log(`voice switch failed (${failedVoice}): ${decodeUtf8(payload)}`);
+			if (workerVoicePath === failedVoice) workerVoicePath = "";
 			return;
 		}
 		const request = activeRequest;
@@ -444,6 +428,8 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		logger.log(`starting Qwen3 TTS ${workerKind} worker: ${label}`);
 		const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
 		worker = child;
+		// See stt.ts: EPIPE after a worker crash must not crash the server; the exit handler restarts it.
+		child.stdin?.on("error", (error) => logger.log(`TTS worker input closed: ${error.message}`));
 		child.stdout?.on("data", (chunk: Buffer) => handleStdoutData(chunk));
 		child.stderr?.on("data", (chunk: Buffer) => {
 			for (const line of chunk.toString("utf8").split(/\r?\n/)) {
@@ -461,6 +447,17 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 			rejectReady?.(error);
 			for (const userId of turns.keys()) failTurn(userId, error.message);
 			if (code !== 0) logger.log(error.message);
+			// Drop in-flight work: a stale activeRequest would block the queue after the restart.
+			activeRequest = undefined;
+			queue.length = 0;
+			stdoutBuffer = Buffer.alloc(0);
+			workerVoicePath = qwen3RefAudio;
+			voiceRequestIds.clear();
+			if (stopping) return;
+			const delay = restartDelaysMs[Math.min(restartAttempts, restartDelaysMs.length - 1)] ?? 30000;
+			restartAttempts++;
+			logger.log(`restarting Qwen3 TTS worker in ${delay / 1000} s`);
+			setTimeout(startWorker, delay).unref();
 		});
 	}
 
@@ -473,10 +470,11 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		});
 	}
 
-	function start(userId: string, nextCallbacks: TtsCallbacks): void {
+	function start(userId: string, nextCallbacks: TtsCallbacks, voicePath = qwen3RefAudio): void {
 		cancelUser(userId, "new TTS stream");
 		turns.set(userId, {
 			callbacks: nextCallbacks,
+			voicePath,
 			pendingRequests: 0,
 			turnEnded: false,
 			streamStarted: false,
@@ -488,7 +486,7 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 		const turn = turns.get(userId);
 		const trimmed = text.trim();
 		if (!turn || !trimmed) return;
-		const request = { id: nextRequestId++, userId, text: trimmed };
+		const request = { id: nextRequestId++, userId, text: trimmed, voicePath: turn.voicePath };
 		turn.pendingRequests++;
 		queue.push(request);
 		pump();
@@ -525,6 +523,7 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 	}
 
 	function stop(): void {
+		stopping = true;
 		try {
 			sendFrame(workerInputShutdown, 0);
 		} catch {
@@ -535,7 +534,7 @@ export function createTtsService(deps: TtsServiceDeps): TtsService {
 
 	startWorker();
 
-	return { ready, start, pushText, end, cancelUser, cancel, stop };
+	return { ready, start, pushText, end, cancelUser, cancel, stop, defaultVoicePath: qwen3RefAudio };
 }
 
 function createDisabledTtsService(logger: Logger): TtsService {
@@ -543,6 +542,7 @@ function createDisabledTtsService(logger: Logger): TtsService {
 	const turns = new Map<string, TtsCallbacks>();
 	return {
 		ready: Promise.resolve(),
+		defaultVoicePath: "",
 		start: (userId, callbacks) => {
 			turns.set(userId, callbacks);
 		},

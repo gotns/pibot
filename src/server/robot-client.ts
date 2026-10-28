@@ -8,6 +8,7 @@ const ttsFrameStart = 1;
 const ttsFrameAudio = 2;
 const ttsFrameDone = 3;
 const ttsFrameError = 4;
+const ttsFrameOpus = 5;
 
 interface PendingRobotRequest {
 	requestType: RobotRpcType;
@@ -107,6 +108,10 @@ export class RobotClient {
 		return this.sendBinaryFrame(ttsFrameAudio, pcm);
 	}
 
+	sendTtsOpus(packet: Uint8Array): boolean {
+		return this.sendBinaryFrame(ttsFrameOpus, packet);
+	}
+
 	sendTtsDone(): boolean {
 		return this.sendBinaryFrame(ttsFrameDone);
 	}
@@ -180,17 +185,10 @@ export class RobotClient {
 		pending.reject(error);
 	}
 
+	// Liveness pings live in websocket-server.ts (they terminate dead sockets); here only drop a socket
+	// that has already closed so pending requests fail fast.
 	private checkConnection(): void {
 		const client = this.current;
-		if (!client) return;
-		if (client.readyState !== WebSocket.OPEN) {
-			this.clearWebSocket(client);
-			return;
-		}
-		try {
-			client.ping();
-		} catch {
-			this.clearWebSocket(client);
-		}
+		if (client && client.readyState !== WebSocket.OPEN) this.clearWebSocket(client);
 	}
 }

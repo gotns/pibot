@@ -14,6 +14,7 @@ public/app.js
 /data/user-memories/
 /data/voices/*
 !/data/voices/elevenlabs-pibot-reference*
+!/data/voices/library/
 
 # native build artifacts
 native/qwen3_tts_rs/build/

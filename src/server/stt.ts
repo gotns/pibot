@@ -1,8 +1,8 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { once } from "node:events";
-import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, rename, stat, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname } from "node:path";
+import { downloadFile } from "./download.js";
 import type { Logger } from "./logger.js";
 
 export interface SttServiceDeps {
@@ -16,6 +16,7 @@ export interface SttServiceDeps {
 export interface SttService {
 	handleAudioFrame: (userId: string, data: Buffer) => void;
 	closeUser: (userId: string) => void;
+	flushUser: (userId: string) => void;
 	stopChildProcess: () => void;
 }
 
@@ -51,6 +52,7 @@ const PARAKEET_CPP_REPO = "https://huggingface.co/mudler/parakeet-cpp-gguf/resol
 const WHISPER_VAD_REPO = "https://huggingface.co/ggml-org/whisper-vad/resolve/main";
 const sttInputAudioFrame = 1;
 const sttInputCloseUser = 2;
+const sttInputFlushUser = 3;
 
 type SttWorkerMsg =
 	| {
@@ -104,6 +106,9 @@ function streamLines(stream: NodeJS.ReadableStream | null | undefined, onLine: (
 export function createSttService(deps: SttServiceDeps): SttService {
 	let childProcess: ChildProcess | undefined;
 	let stdout = "";
+	let stopping = false;
+	let restartAttempts = 0;
+	const restartDelaysMs = [1000, 2000, 5000, 10000, 30000];
 	const logger = deps.logger.tag("stt");
 	const emit = deps.onEvent;
 
@@ -128,12 +133,21 @@ export function createSttService(deps: SttServiceDeps): SttService {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		childProcess = child;
+		// Writing to a worker that just died fails with EPIPE; unhandled, that 'error' event would crash the
+		// whole server. The exit handler restarts the worker.
+		child.stdin?.on("error", (error) => logger.log(`STT worker input closed: ${error.message}`));
 		child.stdout?.on("data", (data: Buffer) => handleStdout(data));
 		streamLines(child.stderr, (line) => logger.log(line));
 		child.once("error", (error) => emit({ type: "error", message: error.message }));
 		child.once("exit", (code, signal) => {
 			if (childProcess === child) childProcess = undefined;
 			logger.log(`parakeet.cpp STT worker exited code=${code ?? "none"} signal=${signal ?? "none"}`);
+			if (stopping) return;
+			// Without a restart the server stays up but deaf; tell connected clients and bring it back.
+			const delay = restartDelaysMs[Math.min(restartAttempts, restartDelaysMs.length - 1)] ?? 30000;
+			restartAttempts++;
+			emit({ type: "error", message: `Speech recognition stopped; restarting in ${delay / 1000} s` });
+			setTimeout(startWorker, delay).unref();
 		});
 	}
 
@@ -150,12 +164,22 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		if (!(await hasUsableFile(deps.parakeetCppModelPath))) {
 			await mkdir(dirname(deps.parakeetCppModelPath), { recursive: true });
 			const file = basename(deps.parakeetCppModelPath);
-			await downloadFile(`${PARAKEET_CPP_REPO}/${file}`, file, deps.parakeetCppModelPath);
+			await downloadFile(
+				`${PARAKEET_CPP_REPO}/${file}`,
+				deps.parakeetCppModelPath,
+				`STT model file ${file}`,
+				logger,
+			);
 		}
 		if (!(await hasUsableFile(deps.sileroVadGgmlModelPath))) {
 			await mkdir(dirname(deps.sileroVadGgmlModelPath), { recursive: true });
 			const file = basename(deps.sileroVadGgmlModelPath);
-			await downloadFile(`${WHISPER_VAD_REPO}/${file}`, file, deps.sileroVadGgmlModelPath);
+			await downloadFile(
+				`${WHISPER_VAD_REPO}/${file}`,
+				deps.sileroVadGgmlModelPath,
+				`VAD model file ${file}`,
+				logger,
+			);
 		}
 	}
 
@@ -164,35 +188,6 @@ export function createSttService(deps: SttServiceDeps): SttService {
 			return (await stat(path)).size > 0;
 		} catch {
 			return false;
-		}
-	}
-
-	async function downloadFile(url: string, file: string, path: string): Promise<void> {
-		const tmpPath = `${path}.tmp-${process.pid}`;
-		await unlink(tmpPath).catch(() => undefined);
-		logger.log(`downloading STT model file ${file}`);
-		const response = await fetch(url);
-		if (!response.ok || !response.body) throw new Error(`failed to download ${file}: HTTP ${response.status}`);
-		const total = Number(response.headers.get("content-length") ?? "0");
-		const reader = response.body.getReader();
-		const output = createWriteStream(tmpPath, { flags: "wx" });
-		let received = 0;
-		try {
-			while (true) {
-				const chunk = await reader.read();
-				if (chunk.done) break;
-				received += chunk.value.byteLength;
-				if (!output.write(chunk.value)) await once(output, "drain");
-			}
-			output.end();
-			await once(output, "finish");
-			await rename(tmpPath, path);
-			const suffix = total > 0 ? ` / ${(total / 1024 / 1024).toFixed(1)} MiB` : "";
-			logger.log(`downloaded ${file} (${(received / 1024 / 1024).toFixed(1)} MiB${suffix})`);
-		} catch (error) {
-			output.destroy();
-			await unlink(tmpPath).catch(() => undefined);
-			throw error;
 		}
 	}
 
@@ -216,6 +211,7 @@ export function createSttService(deps: SttServiceDeps): SttService {
 
 	function handleMessage(message: SttWorkerMsg): void {
 		if (message.type === "ready") {
+			restartAttempts = 0;
 			emit({
 				type: "ready",
 				sampleRate: message.sampleRate,
@@ -286,6 +282,8 @@ export function createSttService(deps: SttServiceDeps): SttService {
 	}
 
 	function handleAudioFrame(userId: string, data: Buffer): void {
+		// The worker reads 16-bit samples; an odd byte count can only be a malformed frame.
+		if (data.byteLength % 2 !== 0) return;
 		writeInputFrame(sttInputAudioFrame, userId, data);
 	}
 
@@ -293,11 +291,17 @@ export function createSttService(deps: SttServiceDeps): SttService {
 		writeInputFrame(sttInputCloseUser, userId);
 	}
 
+	// Ends the user's current utterance immediately (push-to-talk release, mic gate closing).
+	function flushUser(userId: string): void {
+		writeInputFrame(sttInputFlushUser, userId);
+	}
+
 	function stopChildProcess(): void {
+		stopping = true;
 		childProcess?.kill();
 	}
 
 	workerCommand();
 	startWorker();
-	return { handleAudioFrame, closeUser, stopChildProcess };
+	return { handleAudioFrame, closeUser, flushUser, stopChildProcess };
 }

@@ -20,6 +20,7 @@ interface ActiveRobotRequest {
 export interface RobotServerTtsHandlers {
 	startPcmStream: (sampleRate: number) => void;
 	pushPcmAudio: (pcm: Uint8Array) => void;
+	pushOpusAudio: (packet: Uint8Array) => void;
 	finishPcmStream: () => Promise<void>;
 	failPcmStream: (message: string) => void;
 }
@@ -28,16 +29,28 @@ const ttsFrameStart = 1;
 const ttsFrameAudio = 2;
 const ttsFrameDone = 3;
 const ttsFrameError = 4;
+const ttsFrameOpus = 5;
 
 export interface RobotServerEvents {
 	onState: (state: RobotState) => void;
 	onLog: (entry: LogEntry) => void;
 	onSpotifyPlayback: (playback: SpotifyNowPlaying | undefined) => void;
+	onInterim: (text: string) => void;
 	onRejected: (reason: string) => void;
+	onConnectionChange: (connected: boolean) => void;
+	onReplaced: (reason: string) => void;
 }
 
+// Must match replacedCloseCode in src/server/websocket-server.ts.
+const replacedCloseCode = 4000;
+const reconnectDelaysMs = [500, 1000, 2000, 4000, 8000, 10000];
+
 export class RobotServer {
-	private readonly ws: WebSocket;
+	private ws: WebSocket;
+	private readonly url: string;
+	private reconnectAttempts = 0;
+	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	private stopped = false;
 	private readonly logger: ClientLogger;
 	private readonly tools: RobotToolHandlers;
 	private readonly tts: RobotServerTtsHandlers;
@@ -55,12 +68,44 @@ export class RobotServer {
 		this.tools = deps.tools;
 		this.tts = deps.tts;
 		this.events = deps.events;
-		this.ws = new WebSocket(deps.url);
-		this.ws.binaryType = "arraybuffer";
-		this.ws.onopen = () => this.logger.tag("network").log("connected to robot server");
-		this.ws.onclose = (event) => this.handleClose(event);
-		this.ws.onerror = () => this.logger.tag("network").log("robot server connection error");
-		this.ws.onmessage = (event) => this.handleMessage(event);
+		this.url = deps.url;
+		this.ws = this.open();
+		// A phone coming back from sleep or a new network should not wait out the backoff.
+		const reconnectSoon = () => {
+			if (!this.stopped && this.ws.readyState === WebSocket.CLOSED) this.reconnectNow();
+		};
+		document.addEventListener("visibilitychange", () => {
+			if (document.visibilityState === "visible") reconnectSoon();
+		});
+		window.addEventListener("online", reconnectSoon);
+	}
+
+	private open(): WebSocket {
+		const ws = new WebSocket(this.url);
+		ws.binaryType = "arraybuffer";
+		ws.onopen = () => {
+			this.reconnectAttempts = 0;
+			this.logger.tag("network").log("connected to robot server");
+			this.events.onConnectionChange(true);
+		};
+		ws.onclose = (event) => {
+			if (ws === this.ws) this.handleClose(event);
+		};
+		ws.onerror = () => this.logger.tag("network").log("robot server connection error");
+		ws.onmessage = (event) => this.handleMessage(event);
+		return ws;
+	}
+
+	// Reconnect immediately, e.g. after "use pibot on this device" when another device had taken over.
+	reconnectNow(): void {
+		clearTimeout(this.reconnectTimer);
+		this.stopped = false;
+		if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) return;
+		this.ws = this.open();
+	}
+
+	failedAttempts(): number {
+		return this.reconnectAttempts;
 	}
 
 	send(message: ClientMessage): void {
@@ -78,13 +123,28 @@ export class RobotServer {
 	}
 
 	private handleClose(event: CloseEvent): void {
-		if (event.code === 1008) {
-			this.events.onRejected(event.reason || "another client is already connected");
+		for (const request of this.activeRobotRequests.values()) request.controller.abort("connection closed");
+		this.activeRobotRequests.clear();
+		this.events.onConnectionChange(false);
+		if (event.code === replacedCloseCode) {
+			// Another device took over this account; reconnecting would bump it in turn.
+			this.stopped = true;
+			this.events.onReplaced(event.reason || "pibot was opened on another device");
 			return;
 		}
+		if (event.code === 1008) {
+			this.stopped = true;
+			this.events.onRejected(event.reason || "connection refused");
+			return;
+		}
+		const delay = reconnectDelaysMs[Math.min(this.reconnectAttempts, reconnectDelaysMs.length - 1)] ?? 10000;
+		this.reconnectAttempts++;
 		this.logger
 			.tag("network")
-			.log(`disconnected from robot server code=${event.code} reason=${event.reason || "none"}`);
+			.log(
+				`disconnected (code=${event.code}${event.reason ? ` ${event.reason}` : ""}); reconnecting in ${delay} ms`,
+			);
+		this.reconnectTimer = setTimeout(() => this.reconnectNow(), delay);
 	}
 
 	private handleMessage(event: MessageEvent): void {
@@ -110,6 +170,10 @@ export class RobotServer {
 			this.events.onState(message.state);
 			return;
 		}
+		if (message.type === "interim") {
+			this.events.onInterim(message.text);
+			return;
+		}
 		if (message.type === "spotify_playback") {
 			this.events.onSpotifyPlayback(message.playback);
 			return;
@@ -131,6 +195,10 @@ export class RobotServer {
 		}
 		if (kind === ttsFrameAudio) {
 			this.tts.pushPcmAudio(payload);
+			return;
+		}
+		if (kind === ttsFrameOpus) {
+			this.tts.pushOpusAudio(payload);
 			return;
 		}
 		if (kind === ttsFrameDone) {

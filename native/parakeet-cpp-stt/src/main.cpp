@@ -22,6 +22,8 @@ static constexpr size_t VAD_CHUNK_FRAMES = 512;
 static constexpr size_t VAD_CHUNK_MS = 32;
 static constexpr uint8_t INPUT_AUDIO_FRAME = 1;
 static constexpr uint8_t INPUT_CLOSE_USER = 2;
+// Ends the current utterance now instead of waiting for min_silence_ms (push-to-talk release, mic gate).
+static constexpr uint8_t INPUT_FLUSH_USER = 3;
 
 struct Config {
     std::string model_path;
@@ -174,6 +176,45 @@ static void emit_user_event(const std::string& user_id, const std::string& json_
     std::cout << "{\"userId\":\"" << json_escape(user_id) << "\"," << json_tail << "}" << std::endl;
 }
 
+// Emits speech_end + final (or speech_drop when too short) for the current utterance and resets it.
+static void finalize_utterance(const std::string& user_id, UserState& state, parakeet_ctx* model, const Config& cfg) {
+    const size_t min_frames = std::max<size_t>(1, SAMPLE_RATE * cfg.min_utterance_ms / 1000);
+    std::vector<float> audio;
+    for (const auto& c : state.utterance_chunks) audio.insert(audio.end(), c.begin(), c.end());
+    double duration = static_cast<double>(audio.size()) / SAMPLE_RATE;
+    if (audio.size() < min_frames) {
+        emit_user_event(user_id, "\"type\":\"speech_drop\",\"index\":" + std::to_string(state.utterance_index) + ",\"duration\":" + std::to_string(duration) + ",\"reason\":\"too_short\"");
+    } else {
+        emit_user_event(user_id, "\"type\":\"speech_end\",\"index\":" + std::to_string(state.utterance_index) + ",\"duration\":" + std::to_string(duration));
+        auto decode_start = std::chrono::steady_clock::now();
+        std::string text = transcribe(model, audio);
+        auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - decode_start).count();
+        emit_user_event(user_id, "\"type\":\"final\",\"index\":" + std::to_string(state.utterance_index) + ",\"text\":\"" + json_escape(text) + "\",\"duration\":" + std::to_string(duration) + ",\"decodeMs\":" + std::to_string(decode_ms));
+    }
+    state.in_utterance = false;
+    state.utterance_chunks.clear();
+    state.preroll.clear();
+    state.pending.clear();
+    state.vad.reset();
+}
+
+// Decodes the most recent interim_window_ms of a running utterance, so the server can act on "stop"
+// (and show live captions) before the speaker finishes.
+static void emit_interim(const std::string& user_id, UserState& state, parakeet_ctx* model, const Config& cfg, size_t audio_ms) {
+    const size_t window_chunks = cfg.interim_window_ms > 0
+        ? std::max<size_t>(1, cfg.interim_window_ms / VAD_CHUNK_MS)
+        : state.utterance_chunks.size();
+    const size_t first = state.utterance_chunks.size() > window_chunks ? state.utterance_chunks.size() - window_chunks : 0;
+    std::vector<float> window;
+    for (size_t i = first; i < state.utterance_chunks.size(); ++i) {
+        window.insert(window.end(), state.utterance_chunks[i].begin(), state.utterance_chunks[i].end());
+    }
+    auto decode_start = std::chrono::steady_clock::now();
+    std::string text = transcribe(model, window);
+    auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - decode_start).count();
+    emit_user_event(user_id, "\"type\":\"interim\",\"index\":" + std::to_string(state.utterance_index) + ",\"text\":\"" + json_escape(text) + "\",\"audioMs\":" + std::to_string(audio_ms) + ",\"windowMs\":" + std::to_string(window.size() * 1000 / SAMPLE_RATE) + ",\"decodeMs\":" + std::to_string(decode_ms));
+}
+
 static void process_audio(
     const std::string& user_id,
     UserState& state,
@@ -183,7 +224,6 @@ static void process_audio(
     const std::chrono::steady_clock::time_point& started
 ) {
     const size_t preroll_chunks = std::max<size_t>(1, cfg.preroll_ms / VAD_CHUNK_MS);
-    const size_t min_frames = std::max<size_t>(1, SAMPLE_RATE * cfg.min_utterance_ms / 1000);
     const size_t interim_min_frames = std::max<size_t>(1, SAMPLE_RATE * cfg.interim_min_audio_ms / 1000);
 
     state.pending.insert(state.pending.end(), frame.begin(), frame.end());
@@ -212,28 +252,13 @@ static void process_audio(
         size_t audio_frames = 0;
         for (const auto& c : state.utterance_chunks) audio_frames += c.size();
         size_t audio_ms = audio_frames * 1000 / SAMPLE_RATE;
-        if (cfg.interim_interval_ms > 0 && audio_frames >= interim_min_frames && audio_ms - state.last_interim_ms >= cfg.interim_interval_ms) {
+        // Only while speech is actually going on: trailing silence would just re-decode the same words.
+        if (is_speech && cfg.interim_interval_ms > 0 && audio_frames >= interim_min_frames && audio_ms - state.last_interim_ms >= cfg.interim_interval_ms) {
             state.last_interim_ms = audio_ms;
+            emit_interim(user_id, state, model, cfg, audio_ms);
         }
         if (state.silence_ms < cfg.min_silence_ms) continue;
-
-        std::vector<float> audio;
-        audio.reserve(audio_frames);
-        for (const auto& c : state.utterance_chunks) audio.insert(audio.end(), c.begin(), c.end());
-        double duration = static_cast<double>(audio.size()) / SAMPLE_RATE;
-        if (audio.size() < min_frames) {
-            emit_user_event(user_id, "\"type\":\"speech_drop\",\"index\":" + std::to_string(state.utterance_index) + ",\"duration\":" + std::to_string(duration) + ",\"reason\":\"too_short\"");
-        } else {
-            emit_user_event(user_id, "\"type\":\"speech_end\",\"index\":" + std::to_string(state.utterance_index) + ",\"duration\":" + std::to_string(duration));
-            auto decode_start = std::chrono::steady_clock::now();
-            std::string text = transcribe(model, audio);
-            auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - decode_start).count();
-            emit_user_event(user_id, "\"type\":\"final\",\"index\":" + std::to_string(state.utterance_index) + ",\"text\":\"" + json_escape(text) + "\",\"duration\":" + std::to_string(duration) + ",\"decodeMs\":" + std::to_string(decode_ms));
-        }
-        state.in_utterance = false;
-        state.utterance_chunks.clear();
-        state.preroll.clear();
-        state.vad.reset();
+        finalize_utterance(user_id, state, model, cfg);
     }
 }
 
@@ -279,12 +304,24 @@ int main(int argc, char** argv) {
                 users.erase(message.user_id);
                 continue;
             }
+            if (message.type == INPUT_FLUSH_USER) {
+                auto flushed = users.find(message.user_id);
+                if (flushed != users.end() && flushed->second->in_utterance) {
+                    finalize_utterance(message.user_id, *flushed->second, model, cfg);
+                }
+                continue;
+            }
             if (message.type != INPUT_AUDIO_FRAME) continue;
             auto it = users.find(message.user_id);
             if (it == users.end()) {
                 it = users.emplace(message.user_id, std::make_unique<UserState>(cfg.vad_model_path)).first;
             }
-            process_audio(message.user_id, *it->second, model, cfg, decode_pcm16(message.payload), started);
+            // One malformed frame must not take recognition down for everyone.
+            try {
+                process_audio(message.user_id, *it->second, model, cfg, decode_pcm16(message.payload), started);
+            } catch (const std::exception& e) {
+                emit_user_event(message.user_id, "\"type\":\"error\",\"message\":\"" + json_escape(e.what()) + "\"");
+            }
         }
 
         parakeet_capi_free(model);
